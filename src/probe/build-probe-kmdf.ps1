@@ -37,15 +37,23 @@ $sdkL = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0"
 $env:INCLUDE = "$vc\include;$sdkI\ucrt;$sdkI\shared;$sdkI\um"
 $env:LIB     = "$vc\lib\x64;$sdkL\ucrt\x64;$sdkL\um\x64"
 $env:PATH    = "$vc\bin\Hostx64\x64;$env:PATH"
-$inc = "$root\..\native-windows-assets\libusb\libusb"
-$lib = "$root\..\native-windows-assets\libusb\build\v143\x64\Release\dll\libusb-1.0.lib"
-$dll = "$root\..\native-windows-assets\libusb\build\v143\x64\Release\dll\libusb-1.0.dll"
+# --- libusb headers -------------------------------------------------------
+# Only libusb.h is needed (for its opaque handle/enum types). Provide it by either:
+#   * setting $env:LIBUSB_INCLUDE to the folder containing libusb.h, or
+#   * placing libusb.h in third_party/libusb/ at the repo root.
+# See docs/BUILDING.md.
+$inc = if ($env:LIBUSB_INCLUDE) { $env:LIBUSB_INCLUDE } else { Join-Path $root "..\..	hird_party\libusb" }
+if (-not (Test-Path (Join-Path $inc "libusb.h"))) {
+  throw "libusb.h not found in '$inc'. Set $env:LIBUSB_INCLUDE to the directory containing libusb.h, or place it in third_party/libusb/ (see docs/BUILDING.md)."
+}
+$lib = if ($env:LIBUSB_LIB) { $env:LIBUSB_LIB } else { "" }   # optional; the KMDF backend never calls libusb
+$dll = if ($env:LIBUSB_DLL) { $env:LIBUSB_DLL } else { "" }   # optional runtime DLL (unused by the KMDF backend)
 New-Item -ItemType Directory -Force -Path "$root\build" | Out-Null
 Push-Location "$root\build"
 try {
     & cl.exe /nologo /W3 /O2 /EHsc /DNWC_BACKEND_KMDF "/I$inc" "$root\nwcusb_probe.c" `
-        /Fenwcusb_probe_kmdf.exe /link "$lib"
+        /Fenwcusb_probe_kmdf.exe $(if ($lib) { "/link"; $lib })
     if ($LASTEXITCODE -ne 0) { throw "cl.exe failed ($LASTEXITCODE)" }
-    Copy-Item -LiteralPath $dll -Destination "$root\build\" -Force
+    if ($dll) { Copy-Item -LiteralPath $dll -Destination (Join-Path $root "build") -Force }
     Write-Host "[build] wrote $root\build\nwcusb_probe_kmdf.exe"
 } finally { Pop-Location }

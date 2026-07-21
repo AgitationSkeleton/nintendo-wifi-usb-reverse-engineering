@@ -123,10 +123,21 @@ Even unfinished, the useful results are:
 src/probe/    user-mode SoftAP implementation (the bulk of the reverse engineering)
 src/driver/   KMDF kernel driver + in-kernel 802.11 responder, build/sign scripts
 tools/        decoder for USB captures (usbmon-format pcapng) into a register/frame timeline
-docs/         technical notes
+docs/         documentation (below)
 ```
 
-Build scripts target the Windows WDK/SDK and MSVC. The kernel driver requires test-signing to load.
+| Document | Contents |
+|---|---|
+| [docs/BUILDING.md](docs/BUILDING.md) | Prerequisites (MSVC / SDK / WDK / libusb header), build steps, test-signing, and the USB-controller requirement when virtualising the dongle. |
+| [docs/USAGE.md](docs/USAGE.md) | Installing the driver, the probe's commands, the **~20 environment-variable tuning knobs** used to test hypotheses without rebuilding, the offline driver harness, and how to read the client error codes. |
+| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Register map, bring-up ordering, TX/RX descriptor formats, the hardware beacon-ring mechanism, the connector registration protocol, WEP auth, and the auto-ACK analysis. |
+| [docs/reference/original-driver-init-sequence.txt](docs/reference/original-driver-init-sequence.txt) | Our decoded ~3,680-step register/USB init sequence of the **original vendor driver** — the ground truth this implementation was compared against. |
+
+Build scripts target the Windows WDK/SDK and MSVC. The kernel driver requires test-signing to load
+— **use a throwaway VM**, not a machine you care about.
+
+If you are picking this up, the fastest orientation is: `docs/USAGE.md` (the tuning knobs) →
+`docs/TECHNICAL.md` §7 (the unresolved blocker) → the reference init sequence.
 
 ---
 

@@ -32,7 +32,15 @@ $sdkL = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0"
 $env:INCLUDE = "$vc\include;$sdkI\ucrt;$sdkI\shared;$sdkI\um"
 $env:LIB     = "$vc\lib\x86;$sdkL\ucrt\x86;$sdkL\um\x86"
 $env:PATH    = "$vc\bin\Hostx64\x86;$env:PATH"
-$inc = "$root\..\native-windows-assets\libusb\libusb"   # header types only, no lib
+# --- libusb headers -------------------------------------------------------
+# Only libusb.h is needed (for its opaque handle/enum types). Provide it by either:
+#   * setting $env:LIBUSB_INCLUDE to the folder containing libusb.h, or
+#   * placing libusb.h in third_party/libusb/ at the repo root.
+# See docs/BUILDING.md.
+$inc = if ($env:LIBUSB_INCLUDE) { $env:LIBUSB_INCLUDE } else { Join-Path $root "..\..	hird_party\libusb" }
+if (-not (Test-Path (Join-Path $inc "libusb.h"))) {
+  throw "libusb.h not found in '$inc'. Set $env:LIBUSB_INCLUDE to the directory containing libusb.h, or place it in third_party/libusb/ (see docs/BUILDING.md)."
+}
 New-Item -ItemType Directory -Force -Path "$root\build-x86" | Out-Null
 Push-Location "$root\build-x86"
 try {
