@@ -1,0 +1,68 @@
+;
+; nwcusbap.inf — KMDF USB function driver for the Nintendo Wi-Fi USB Connector
+; (Ralink RT2570, USB\VID_0411&PID_008B). Replaces the WinUSB binding.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Sample
+ClassGuid   = {78A1C341-4539-11d3-B88D-00C04FAD5171}
+Provider    = %ProviderName%
+CatalogFile = nwcusbap.cat
+DriverVer   = 07/18/2026,1.0.0.6
+PnpLockdown = 1
+
+[ClassInstall32]
+AddReg = SampleClass_RegistryAdd
+
+[SampleClass_RegistryAdd]
+HKR,,,,%ClassName%
+HKR,,Icon,,-5
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64,NTx86
+
+[Standard.NTamd64]
+%DeviceDesc% = nwcusbap_Install, USB\VID_0411&PID_008B
+
+[Standard.NTx86]
+%DeviceDesc% = nwcusbap_Install, USB\VID_0411&PID_008B
+
+; ================= install =================
+[nwcusbap_Install.NT]
+CopyFiles = nwcusbap_CopyFiles
+
+[nwcusbap_CopyFiles]
+nwcusbap.sys
+
+[nwcusbap_Install.NT.Services]
+AddService = nwcusbap, 0x00000002, nwcusbap_Service
+
+[nwcusbap_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1  ; SERVICE_KERNEL_DRIVER
+StartType     = 3  ; SERVICE_DEMAND_START
+ErrorControl  = 1  ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\nwcusbap.sys
+
+; KMDF co-installer wiring
+[nwcusbap_Install.NT.Wdf]
+KmdfService = nwcusbap, nwcusbap_wdfsect
+
+[nwcusbap_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[DestinationDirs]
+nwcusbap_CopyFiles = 13  ; DIRID_DRIVER_STORE
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+nwcusbap.sys = 1
+
+[Strings]
+ProviderName = "NWCUSBAP Project"
+ClassName    = "NWCUSBAP Sample Devices"
+DeviceDesc   = "Nintendo Wi-Fi USB Connector (RT2570, KMDF)"
+ServiceDesc  = "Nintendo Wi-Fi USB Connector KMDF Driver"
+DiskName     = "NWCUSBAP Install Disk"

@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build/
+build-x86/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.sys
+*.cat
+*.log
+
+# ---------------------------------------------------------------------------
+# NEVER COMMIT — third-party / vendor material (not ours to redistribute)
+# ---------------------------------------------------------------------------
+# Vendor drivers, installers and the original Windows software
+*.SYS
+rt25usbap*
+RT25USBAP*
+WiFiConnector/
+NintendoWFCReg*
+*.msi
+*.cab
+*.vbox-extpack
+
+# Packet captures (contain hardware addresses and third-party traffic)
+*.pcap
+*.pcapng
+*.usbpcap
+*.etl
+
+# Disk / VM images
+*.qcow2
+*.vdi
+*.vmdk
+*.iso
+
+# ROMs / game assets
+*.nds
+*.z64
+*.n64
+*.o2r
+*.otr
+
+# ---------------------------------------------------------------------------
+# NEVER COMMIT — local / personal
+# ---------------------------------------------------------------------------
+# Signing material
+*.pfx
+*.cer
+*.pvk
+*.spc
+
+# Local scratch, captures and machine-specific notes
+scratch/
+scratchpad/
+local/
+*.local
+*_local.*
+timeline.txt
+
+# Python artifacts
+__pycache__/
+*.pyc
