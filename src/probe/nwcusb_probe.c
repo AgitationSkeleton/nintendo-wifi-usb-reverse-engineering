@@ -15,6 +15,21 @@
 #include <windows.h>
 #endif
 #include "libusb.h"
+#ifndef _WIN32
+#include "linux_compat.h"
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+static int g_tap_fd = -1;            /* TAP fd for the DS<->internet data bridge (NWC_DATAPATH) */
+static uint8_t g_sta_mac[6] = {0};   /* associated DS station MAC, learned from RX data */
+static int g_sta_known = 0;
+static void tiny_sleep(void);
+static int mgmt_ie_offset(const uint8_t *frame, int frame_len);
+#endif
+
 
 #ifdef NWC_BACKEND_KMDF
 /*
@@ -229,10 +244,9 @@ static bool contains_utf16le_ascii_nocase(const uint8_t *data, int len, const ch
 
 static bool contains_registration_hint(const uint8_t *data, int len)
 {
-    /* NOTE: the DS's registration probe also embeds the console's user nickname
-     * (UTF-16LE) alongside these constant markers -- matching it makes detection
-     * stricter, but it is per-console, so we match only the constant markers here. */
-    return contains_ascii_nocase(data, len, "Nintendo") ||
+    return contains_ascii_nocase(data, len, "PlayerName") ||
+           contains_utf16le_ascii_nocase(data, len, "PlayerName") ||
+           contains_ascii_nocase(data, len, "Nintendo") ||
            contains_utf16le_ascii_nocase(data, len, "Nintendo") ||
            contains_ascii_nocase(data, len, "NWCUSB") ||
            contains_utf16le_ascii_nocase(data, len, "NWCUSB");
@@ -364,7 +378,7 @@ static void tiny_sleep(void)
 #ifdef _WIN32
     Sleep(1);
 #else
-    libusb_sleep(0);
+    usleep(1000);
 #endif
 }
 
@@ -432,7 +446,7 @@ static uint16_t eeprom_word(const uint8_t *eeprom, uint16_t word_index)
 
 static int read_eeprom(libusb_device_handle *handle, uint8_t *eeprom, uint16_t length)
 {
-    static const uint8_t fallback_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };  /* placeholder; the real MAC is read from EEPROM offset 0x04 */
+    static const uint8_t fallback_mac[6] = { 0x00, 0x16, 0x01, 0x78, 0x74, 0x21 };
 
     memset(eeprom, 0, length);
     for (int attempt = 1; attempt <= 3; attempt++) {
@@ -981,8 +995,12 @@ static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
                             size_t frame_len, bool request_timestamp,
                             bool request_ack, const char *label)
 {
-    uint8_t packet[20 + 512 + 4];
-    if (frame_len > 512)
+    /* Was 512 — too small for bridged DS<->internet DATA frames: a full TCP segment (e.g. the
+     * conntest HTTP response, ~536B payload) + SNAP + WEP + 802.11 header exceeds 512 and was
+     * silently rejected, so the DS never received downstream data (52203 at the last step). The
+     * RT2570 TXD DATABYTE_COUNT is 12 bits (max 4095); 1600 covers a standard 1500-MTU frame. */
+    uint8_t packet[20 + 1600 + 4];
+    if (frame_len > 1600)
         return LIBUSB_ERROR_INVALID_PARAM;
     memset(packet, 0, sizeof(packet));
 
@@ -1065,8 +1083,15 @@ static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
      * software-kick-only path — the precondition for the hardware auto-ACK
      * (which has no software kick) to be able to transmit at all. */
     int noguard = (getenv("NWC_NOGUARDIAN") && *getenv("NWC_NOGUARDIAN"));
+    /* usbmon capture of the WORKING original XP driver: the guardian byte precedes ONLY the
+     * beacon; data/mgmt frames (incl. the seq2 auth-response, frame 15447) are a bare bulk-OUT
+     * with NO guardian. We had been prepending a guardian to every frame — a candidate for why
+     * our unicast seq2 never radiates. Match the original: guardian beacons only.
+     * NWC_GUARD_ALL restores the old "guardian every frame" behaviour for A/B testing. */
+    int guard_all = (getenv("NWC_GUARD_ALL") && *getenv("NWC_GUARD_ALL"));
+    int want_guardian = guard_all || (strstr(label, "beacon") != NULL);
     int rc = 0;
-    if (!noguard) {
+    if (!noguard && want_guardian) {
         rc = libusb_bulk_transfer(handle, BULK_OUT_EP, &guardian, 1, &transferred, 2000);
         if (rc != 0) {
             printf("[tx] %s guardian failed: %s\n", label, libusb_error_name(rc));
@@ -1095,6 +1120,211 @@ static int send_beacon(libusb_device_handle *handle, const uint8_t mac[6], const
         printf("[beacon] ssid=\"%s\" channel=%u\n", ssid, channel);
     return send_80211_frame(handle, frame, frame_len, true, false, "beacon");
 }
+
+/* Raw bulk-OUT of len bytes to the TX endpoint (no guardian/descriptor logic of its own) —
+ * used for the beacon guardian byte and the beacon frame, matching rt2500usb's URB submits. */
+static int raw_bulk_out(libusb_device_handle *handle, const uint8_t *buf, int len, const char *label)
+{
+#ifdef NWC_BACKEND_KMDF
+    (void)handle; DWORD ret = 0;
+    if (!DeviceIoControl(g_kmdf, IOCTL_NWC_TX_FRAME, (LPVOID)buf, (DWORD)len, NULL, 0, &ret, NULL)) {
+        printf("[hwbcn] %s bulk failed: gle=%lu\n", label, GetLastError());
+        return LIBUSB_ERROR_IO;
+    }
+    return 0;
+#else
+    int tr = 0;
+    int rc = libusb_bulk_transfer(handle, BULK_OUT_EP, (unsigned char *)buf, len, &tr, 2000);
+    if (rc != 0) { printf("[hwbcn] %s bulk failed: %s\n", label, libusb_error_name(rc)); return rc; }
+    return 0;
+#endif
+}
+
+/*
+ * Arm the RT2570 HARDWARE beacon generator so the chip auto-transmits the beacon at every TBTT
+ * (proper AP / original-driver behavior) — instead of us bulk-sending a software beacon every
+ * 100ms. This is the precondition for a live TSF and the hardware auto-responder.
+ *
+ * VERIFIED against rt2500usb_write_beacon (linux rt2x00): there is NO beacon register buffer —
+ * the beacon is a plain bulk transfer to the (single) OUT endpoint 0x01, with this exact dance:
+ *   1) clear BEACON_GEN in TXRX_CSR19
+ *   2) submit a 1-byte guardian on the beacon pipe
+ *   3) toggle TXRX_CSR19 BEACON_GEN on/off/on/off/on (source: "Beacon generation will fail
+ *      initially ... change TXRX_CSR19 several times"), with TSF_COUNT|TBCN set
+ *   4) send the [20B TXdesc][beacon] frame (rt2500usb does this async on guardian completion)
+ */
+static int hw_load_beacon(libusb_device_handle *handle, const uint8_t mac[6], const char *ssid,
+                          uint8_t channel, bool privacy, uint16_t csr19_on, uint16_t csr19_off)
+{
+    uint8_t frame[256];
+    size_t frame_len = build_beacon(frame, sizeof(frame), mac, ssid, channel, privacy);
+    if (!frame_len) return LIBUSB_ERROR_INVALID_PARAM;
+
+    /* [20-byte TX descriptor][beacon frame]; descriptor = beacon flavour (ts=1, ack=0). */
+    uint8_t pkt[20 + 256]; memset(pkt, 0, sizeof(pkt));
+    uint32_t w0 = 0x00000400u | 0x00001000u | (((uint32_t)frame_len & 0x0fff) << 16); /* TS|NEWSEQ|len */
+    uint32_t w1 = (2u << 6) | (4u << 8) | (10u << 12);
+    uint32_t dl = (uint32_t)frame_len + 4u, plcp = dl * 8u;
+    uint32_t w2 = (0x04u << 8) | ((plcp & 0xffu) << 16) | (((plcp >> 8) & 0xffu) << 24);
+    put32(pkt + 0, w0); put32(pkt + 4, w1); put32(pkt + 8, w2);
+    memcpy(pkt + 20, frame, frame_len);
+    int total = 20 + (int)frame_len;
+    int xfer = total; if (xfer & 1) xfer++; if ((xfer % 512) == 0) xfer += 2; /* rt2500usb get_tx_data_len */
+
+    write16(handle, TXRX_CSR19, csr19_off);                 /* 1) BEACON_GEN off */
+    uint8_t guardian = 0;
+    int rc = raw_bulk_out(handle, &guardian, 1, "guardian"); /* 2) guardian byte */
+    if (rc) return rc;
+    write16(handle, TXRX_CSR19, csr19_on);                  /* 3) on/off/on/off/on toggle */
+    write16(handle, TXRX_CSR19, csr19_off);
+    write16(handle, TXRX_CSR19, csr19_on);
+    write16(handle, TXRX_CSR19, csr19_off);
+    write16(handle, TXRX_CSR19, csr19_on);
+    rc = raw_bulk_out(handle, pkt, xfer, "beacon-frame");    /* 4) the beacon */
+    if (rc) return rc;
+    printf("[hwbcn] bulk beacon armed: guardian + %d-byte frame on EP; CSR19 off=0x%04x on=0x%04x\n",
+           xfer, csr19_off, csr19_on);
+    return 0;
+}
+
+/* ---- DS<->internet data bridge (NWC_DATAPATH): TAP + software WEP + 802.11<->Ethernet ---- */
+#ifndef _WIN32
+static const uint8_t SNAP_HDR[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+
+/* WEP-encrypt a plaintext body -> [IV(3)][keyid(1)][RC4(plain||ICV)]. Returns out length. */
+static int wep_encrypt_body(const uint8_t *plain, int plain_len, const uint8_t key[13],
+                            uint8_t *out, int out_cap)
+{
+    if (plain_len < 0 || plain_len > 2304 || plain_len + 8 > out_cap) return -1;
+    static uint32_t iv_ctr = 1;
+    iv_ctr = (iv_ctr + 1) & 0x00ffffffu;
+    out[0] = (uint8_t)(iv_ctr & 0xff);
+    out[1] = (uint8_t)((iv_ctr >> 8) & 0xff);
+    out[2] = (uint8_t)((iv_ctr >> 16) & 0xff);
+    out[3] = 0;                                   /* key id 0 */
+    uint8_t buf[2320];
+    memcpy(buf, plain, plain_len);
+    uint32_t icv = crc32_ieee(plain, plain_len);
+    buf[plain_len + 0] = (uint8_t)(icv & 0xff);
+    buf[plain_len + 1] = (uint8_t)((icv >> 8) & 0xff);
+    buf[plain_len + 2] = (uint8_t)((icv >> 16) & 0xff);
+    buf[plain_len + 3] = (uint8_t)((icv >> 24) & 0xff);
+    uint8_t rc4_key[16];
+    rc4_key[0] = out[0]; rc4_key[1] = out[1]; rc4_key[2] = out[2];
+    memcpy(rc4_key + 3, key, 13);
+    rc4_crypt(rc4_key, sizeof rc4_key, buf, out + 4, plain_len + 4);
+    return 4 + plain_len + 4;
+}
+
+static int tap_open(const char *name)
+{
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) { printf("[tap] open /dev/net/tun failed: %s\n", strerror(errno)); return -1; }
+    struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        printf("[tap] TUNSETIFF %s failed: %s (create it: ip tuntap add %s mode tap)\n",
+               name, strerror(errno), name);
+        close(fd); return -1;
+    }
+    int fl = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    printf("[tap] bridge attached to %s (fd=%d)\n", name, fd);
+    return fd;
+}
+
+/* DS data frame (from RX) -> decrypt -> Ethernet -> TAP (into the Linux net stack -> NAT). */
+static void tap_rx_dsdata(const uint8_t *frame, int frame_len, const char *ssid)
+{
+    if (g_tap_fd < 0 || frame_len < 24) return;
+    uint16_t fc = get16(frame);
+    if (((fc >> 2) & 0x3) != 2) return;            /* type 2 = data */
+    uint8_t subtype = (uint8_t)((fc >> 4) & 0xf);
+    if (subtype & 0x4) return;                     /* Null / CF / QoS-Null: no data payload */
+    int hdrlen = 24;
+    if (subtype & 0x8) hdrlen += 2;                /* QoS data -> +2 QoS control */
+    bool prot = (fc & 0x4000) != 0;
+    if (frame_len < hdrlen + 8) return;
+
+    /* The RT2570 HW-decrypts WEP in place: it leaves the 4-byte IV/keyid and puts the decrypted
+     * SNAP+payload at frame+hdrlen+4, with the ICV(4) trailing. Prefer that (matches the auth
+     * path's frame+28). Fall back to software decrypt only if the HW plaintext isn't a SNAP hdr. */
+    uint8_t swbuf[2320];
+    const uint8_t *plain = NULL; int plain_len = 0;
+    if (prot) {
+        int off = hdrlen + 4;
+        int hw_len = frame_len - off - 4;          /* minus trailing ICV */
+        if (hw_len >= 8 && memcmp(frame + off, SNAP_HDR, 6) == 0) {
+            plain = frame + off; plain_len = hw_len;
+        } else {
+            uint8_t wk[13]; derive_original_wep_key(ssid + 12, wk);
+            int pl = 0;
+            if (wep_decrypt_body(frame + hdrlen, frame_len - hdrlen, wk, swbuf, sizeof swbuf, &pl)
+                && pl >= 8 && memcmp(swbuf, SNAP_HDR, 6) == 0) { plain = swbuf; plain_len = pl; }
+        }
+    } else {
+        int pl = frame_len - hdrlen;
+        if (pl >= 8 && memcmp(frame + hdrlen, SNAP_HDR, 6) == 0) { plain = frame + hdrlen; plain_len = pl; }
+    }
+    if (!plain || plain_len < 8) return;
+    const uint8_t *sa = frame + 10, *da = frame + 16;   /* ToDS: addr2=SA(DS), addr3=DA */
+    int paylen = plain_len - 8;
+    uint8_t eth[1600];
+    if (14 + paylen > (int)sizeof eth) return;
+    memcpy(eth + 0, da, 6);
+    memcpy(eth + 6, sa, 6);
+    eth[12] = plain[6]; eth[13] = plain[7];        /* ethertype from SNAP */
+    memcpy(eth + 14, plain + 8, paylen);
+    if (!g_sta_known) { memcpy(g_sta_mac, sa, 6); g_sta_known = 1;
+        printf("[bridge] learned DS station %02x:%02x:%02x:%02x:%02x:%02x\n",
+               sa[0],sa[1],sa[2],sa[3],sa[4],sa[5]); }
+    if (write(g_tap_fd, eth, 14 + paylen) < 0 && errno != EAGAIN) { /* ignore */ }
+}
+
+/* Ethernet from TAP (NAT replies) -> 802.11 data -> WEP-encrypt -> TX to the DS. */
+static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
+                            size_t frame_len, bool request_timestamp,
+                            bool request_ack, const char *label);
+static void tap_poll_to_ds(libusb_device_handle *handle, const uint8_t mac[6],
+                           const char *ssid, bool privacy)
+{
+    if (g_tap_fd < 0) return;
+    uint8_t eth[1600];
+    for (int iter = 0; iter < 12; iter++) {
+        ssize_t n = read(g_tap_fd, eth, sizeof eth);
+        if (n <= 14) return;                       /* EAGAIN / runt */
+        const uint8_t *da = eth + 0;               /* dest = DS */
+        const uint8_t *sa = eth + 6;               /* src = gateway (nwc0) */
+        int paylen = (int)n - 14;
+        uint8_t plainbody[2320];
+        memcpy(plainbody, SNAP_HDR, 6);
+        plainbody[6] = eth[12]; plainbody[7] = eth[13];
+        if (8 + paylen > (int)sizeof plainbody) continue;
+        memcpy(plainbody + 8, eth + 14, paylen);
+        int bp_len = 8 + paylen;
+
+        uint8_t out[2400];
+        uint16_t fc = 0x0208;                      /* data, FromDS=1 */
+        put16(out + 0, fc);
+        put16(out + 2, 0x0000);                    /* duration */
+        memcpy(out + 4, da, 6);                    /* addr1 = DA (DS) */
+        memcpy(out + 10, mac, 6);                  /* addr2 = BSSID (us) */
+        memcpy(out + 16, sa, 6);                   /* addr3 = SA (gateway) */
+        put16(out + 22, 0x0000);                   /* seq */
+        int body_len;
+        if (privacy) {
+            uint8_t wk[13]; derive_original_wep_key(ssid + 12, wk);
+            body_len = wep_encrypt_body(plainbody, bp_len, wk, out + 24, (int)sizeof out - 24);
+            if (body_len < 0) continue;
+            put16(out + 0, (uint16_t)(fc | 0x4000));   /* Protected */
+        } else {
+            if (24 + bp_len > (int)sizeof out) continue;
+            memcpy(out + 24, plainbody, bp_len); body_len = bp_len;
+        }
+        send_80211_frame(handle, out, (size_t)(24 + body_len), false, true, "data");
+    }
+}
+#endif /* !_WIN32 */
 
 static int send_probe_response(libusb_device_handle *handle, const uint8_t mac[6],
                                const uint8_t dst[6], const char *ssid, uint8_t channel,
@@ -1186,7 +1416,15 @@ static int send_auth_response(libusb_device_handle *handle, const uint8_t mac[6]
     printf("[auth] response to %02x:%02x:%02x:%02x:%02x:%02x alg=%u seq=%u status=%u challenge=%u\n",
            dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], auth_alg, auth_seq, status,
            include_challenge ? 1 : 0);
-    return send_80211_frame(handle, frame, frame_len, false, true, "auth-response");
+    /* OTA sniff (AR9271) proved auth-responses submit+succeed over USB but NEVER radiate,
+     * while probe-responses (same TX fn) DO. The one descriptor bit that differs is 0x400
+     * ("timestamp"). NWC_AUTH_TS=1 sets it on auth to test whether 0x400 is really a
+     * TX-enable/autonomous bit (radio only inserts TSF for beacon/proberesp subtypes) rather
+     * than a corrupting timestamp-insert. NWC_AUTH_NOACK=1 makes seq2 fire-and-forget so the
+     * single TX engine doesn't stall waiting on the DS ACK. */
+    bool auth_ts   =  (getenv("NWC_AUTH_TS")    && *getenv("NWC_AUTH_TS"));
+    bool auth_ack  = !(getenv("NWC_AUTH_NOACK") && *getenv("NWC_AUTH_NOACK"));
+    return send_80211_frame(handle, frame, frame_len, auth_ts, auth_ack, "auth-response");
 }
 
 static int send_assoc_response(libusb_device_handle *handle, const uint8_t mac[6],
@@ -1220,10 +1458,35 @@ static bool is_mgmt_subtype(const uint8_t *frame, int frame_len, uint8_t subtype
     return ((fc >> 2) & 0x3) == 0 && ((fc >> 4) & 0xf) == subtype;
 }
 
+/* Per-station probe-response throttle. OTA sniff showed the DS's directed NWCUSBAP probe
+ * storm (2022 answered / 291 radiated) saturates the RT2570's SINGLE TX engine — starving
+ * the seq2 auth-response of a TX slot. NWC_PROBE_MINGAP_MS>0 answers each station at most
+ * once per that many ms, freeing the engine during the auth window. 0 = answer every probe. */
+static bool probe_throttled(const uint8_t src[6])
+{
+    const char *e = getenv("NWC_PROBE_MINGAP_MS");
+    unsigned long gap = (e && *e) ? strtoul(e, NULL, 10) : 0;
+    if (!gap) return false;
+    static struct { uint8_t mac[6]; unsigned long tick; int used; } tbl[16];
+    unsigned long now = GetTickCount();
+    for (int i = 0; i < 16; i++)
+        if (tbl[i].used && memcmp(tbl[i].mac, src, 6) == 0) {
+            if (now - tbl[i].tick < gap) return true;
+            tbl[i].tick = now; return false;
+        }
+    for (int i = 0; i < 16; i++)
+        if (!tbl[i].used || now - tbl[i].tick > 8000u) {
+            memcpy(tbl[i].mac, src, 6); tbl[i].tick = now; tbl[i].used = 1; return false;
+        }
+    return false;
+}
+
 static bool should_answer_probe(const uint8_t *frame, int frame_len, const char *ssid)
 {
     (void)ssid;
     if (!is_probe_request(frame, frame_len))
+        return false;
+    if (probe_throttled(frame + 10))
         return false;
     /* P1: only answer probes aimed at OUR connector — the SSID IE must begin "NWCUSBAP"
      * (the DS's registration probe, or a directed probe for our SSID). Skip the
@@ -1425,7 +1688,12 @@ static void maybe_answer_management(libusb_device_handle *handle, const uint8_t 
         if (alg == 0 && seq == 1) {
             send_auth_response(handle, mac, src, alg, 2, 0, false);
         } else if (alg == 1 && seq == 1) {
-            send_auth_response(handle, mac, src, alg, 2, 0, true);
+            /* OTA sniff: the 160B challenge-bearing seq2 physically never radiates over our
+             * libusb TX path (a short seq2 does). NWC_AUTH_NOCHAL sends a challenge-less seq2
+             * that DOES radiate — the DS self-derives the WEP key per the connector flow, so
+             * it may accept it and advance to seq3. */
+            bool nochal = (getenv("NWC_AUTH_NOCHAL") && *getenv("NWC_AUTH_NOCHAL"));
+            send_auth_response(handle, mac, src, alg, 2, 0, !nochal);
         } else if (alg == 1 && seq == 3) {
             /* Send seq4=success UNCONDITIONALLY on seq3 — the gold XP capture shows
              * the connector immediately accepts (seq4 status=0) and never re-verifies
@@ -1569,7 +1837,7 @@ static void log_80211_frame(const uint8_t *frame, int frame_len, const char *sou
            frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
            frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
     if (registration_hint)
-        printf("[rx] *** registration hint matched: <ds-nickname>/Nintendo/NWCUSB bytes present ***\n");
+        printf("[rx] *** registration hint matched: PlayerName/Nintendo/NWCUSB bytes present ***\n");
 
     uint8_t subtype = (uint8_t)((fc >> 4) & 0xf);
     if (subtype == 4)
@@ -1629,8 +1897,12 @@ static void log_rx_packet(libusb_device_handle *handle, const uint8_t *buf, int 
     uint16_t raw_fc = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
     if ((raw_fc & 0x0003) == 0 && ((raw_fc >> 2) & 0x3) <= 2) {
         log_80211_frame(buf, len, "raw", ap_mac, ap_ssid);
-        if (ap_mac && ap_ssid)
+        if (ap_mac && ap_ssid) {
             maybe_answer_management(handle, buf, len, ap_mac, ap_ssid, channel, privacy);
+#ifndef _WIN32
+            tap_rx_dsdata(buf, len, ap_ssid);
+#endif
+        }
         return;
     }
 
@@ -1657,8 +1929,12 @@ static void log_rx_packet(libusb_device_handle *handle, const uint8_t *buf, int 
             printf("[rx] descriptor len=%d data=%u rssi=%u signal=0x%02x flags=0x%08x\n",
                    len, data_len, rssi, signal, w0);
         log_80211_frame(frame, frame_avail, "desc", ap_mac, ap_ssid);
-        if (ap_mac && ap_ssid)
+        if (ap_mac && ap_ssid) {
             maybe_answer_management(handle, frame, frame_avail, ap_mac, ap_ssid, channel, privacy);
+#ifndef _WIN32
+            tap_rx_dsdata(frame, frame_avail, ap_ssid);
+#endif
+        }
     } else {
         printf("[rx] len=%d data=%u rssi=%u signal=0x%02x flags=0x%08x\n",
                len, data_len, rssi, signal, w0);
@@ -1747,7 +2023,16 @@ static int config_ap_regs(libusb_device_handle *handle, const uint8_t mac[6])
      * value un-shifted, landing beacon_int*4 across OFFSET+low INTERVAL bits and
      * yielding a beacon period ~16x too short (broken TBTT / no stable beacons).
      */
-    write16(handle, TXRX_CSR18, (uint16_t)(((100u * 4u) << 4) & 0xfff0u));
+    /* TXRX_CSR18 beacon interval. usbmon diff vs rt2500usb (LIVE HW beacon): rt2500usb
+     * writes 0x0640 (INTERVAL=100 in bits 4-15 => 100 TU), we wrote 0x1900 (INTERVAL=400,
+     * 4x too long) — a prime reason the HW beacon/TBTT engine never fires. NWC_CSR18
+     * overrides; e.g. NWC_CSR18=0x0640 to match rt2500usb exactly. */
+    {
+        const char *e = getenv("NWC_CSR18");
+        uint16_t csr18 = e && *e ? (uint16_t)strtol(e, NULL, 0)
+                                 : (uint16_t)(((100u * 4u) << 4) & 0xfff0u);
+        write16(handle, TXRX_CSR18, csr18);
+    }
     /* TXRX_CSR10 auto-responder control = 0x000a (rt25usbap.sys go-live, fr5066).
      * We previously wrote 0x0000, which clears bits 1 and 3 that the SIFS auto-ACK
      * responder relies on. This value was never tried (MATCHORIG did NOT set it).
@@ -2033,7 +2318,17 @@ static int basic_init(libusb_device_handle *handle)
     read16(handle, MAC_CSR8, &reg);
     write16(handle, MAC_CSR8, (reg & (uint16_t)~0x0fff) | 0x0780);   /* MAX_FRAME_UNIT=1920, original rt25usbap.sys (RE VMA 0x1b197); Linux used 0x0a00 */
     read16(handle, TXRX_CSR0, &reg);
-    write16(handle, TXRX_CSR0, (uint16_t)((reg & (uint16_t)~0x1fff) | (24 << 3)));
+    {
+        /* TXRX_CSR0 = SECURITY control (ALGORITHM 0x7 | IV_OFFSET 0x1f8 | KEY_ID 0x1e00). The
+         * usbmon capture of the WORKING original XP driver during a full DS auth has this =0x1ec2
+         * (KEY_ID=0xf); we had KEY_ID=0 (final 0x02c2). This register governs UNICAST encryption
+         * handling, so it's a prime suspect for why our unicast seq2->DS never radiates while
+         * broadcast beacons/probe-responses do. NWC_CSR0 forces the low 13 bits (e.g. 0x1ec2). */
+        uint16_t low = (uint16_t)(24u << 3);   /* IV_OFFSET=24, KEY_ID=0 (old default) */
+        const char *e = getenv("NWC_CSR0");
+        if (e && *e) low = (uint16_t)(strtol(e, NULL, 0) & 0x1fff);
+        write16(handle, TXRX_CSR0, (uint16_t)((reg & (uint16_t)~0x1fff) | low));
+    }
     read16(handle, MAC_CSR18, &reg);
     write16(handle, MAC_CSR18, (reg & (uint16_t)~0x00ff) | 90);
     read16(handle, PHY_CSR4, &reg);
@@ -2371,8 +2666,33 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
      * hardware SIFS auto-ACK is never contending with a bulk-OUT software TX.
      * (The old "hw beacon doesn't radiate" note predates the KMDF bulk fix.) */
     int no_sw_beacon = getenv("NWC_NOSWBEACON") ? 1 : 0;
+#ifndef _WIN32
+    /* NWC_DATAPATH: bridge the DS's data traffic to the internet. Attach to the pre-created TAP
+     * (default nwc0; NWC_TAP overrides) so DHCP (dnsmasq on nwc0) + NAT (iptables) carry the DS
+     * online. Getting past 52003 needs this — the probe was management-only before. */
+    if (getenv("NWC_DATAPATH") && *getenv("NWC_DATAPATH")) {
+        const char *tn = getenv("NWC_TAP"); if (!tn || !*tn) tn = "nwc0";
+        g_tap_fd = tap_open(tn);
+        if (g_tap_fd >= 0) printf("[bridge] DS<->internet data path ENABLED via %s\n", tn);
+    }
+#endif
+    /* NWC_HWBEACON: load the beacon into the RT2570 HARDWARE beacon buffer (0x2c00) so the
+     * chip free-runs the beacon at each TBTT — the original-driver behavior. Implies no
+     * software beacon (the HW does it). This is what should bring the TSF/auto-responder
+     * fully alive so seq2/auth is serviced in AP mode. */
+    int hw_beacon = getenv("NWC_HWBEACON") ? 1 : 0;
+    if (hw_beacon) {
+        /* Arm the hardware beacon engine (starts the TSF/TBTT ticking — STA_CSR5 counts).
+         * Do NOT force the software beacon off: the HW beacon content doesn't radiate yet, so
+         * the SW beacon still carries discovery while the HW engine keeps the TSF alive for
+         * the auto-responder. NWC_NOSWBEACON=1 can still disable the SW beacon for HW-only tests. */
+        hw_load_beacon(handle, mac, ssid, channel, privacy, on, off);
+    }
     if (no_sw_beacon)
         printf("[ap] software beacon DISABLED (NWC_NOSWBEACON): hardware BEACON_GEN only\n");
+    if (hw_beacon)
+        printf("[ap] hardware beacon engine ARMED (NWC_HWBEACON); software beacon %s\n",
+               no_sw_beacon ? "OFF" : "ON (for discovery)");
     /* Replicate rt25usbap.sys's continuous post-init runtime loop: the XP driver re-writes
      * the slot/SIFS/EIFS timing triple (MAC_CSR10/11/12) and polls STA_CSR0 (FCS err) HUNDREDS
      * of times after init. Hypothesis: the RT2570 loses/drifts the SIFS value after events
@@ -2439,10 +2759,28 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
         {
             poll_rx(handle, 20, mac, ssid, channel, privacy);
         }
+#ifndef _WIN32
+        tap_poll_to_ds(handle, mac, ssid, privacy);   /* drain TAP (NAT replies) -> WEP -> TX to DS */
+#endif
         unsigned long now = GetTickCount();
         if (!no_sw_beacon && beacon_len && (now - last_beacon) >= 100u) {
             send_80211_frame(handle, beacon_frame, beacon_len, true, false, "beacon-sw");
             last_beacon = now;
+        }
+        /* NWC_TXTEST: fire synthetic frames to dummy dests every 2s so the AR9271 sniff
+         * shows WHICH frame kinds actually radiate — no DS needed. Distinct dest MACs:
+         *   ->..11 probe-resp (baseline that radiates)   ->..22 full 160B auth-resp
+         *   ->..33 short auth-resp (no challenge)         ->..44 raw 160B via probe path */
+        static unsigned long last_txtest = 0;
+        if (getenv("NWC_TXTEST") && *getenv("NWC_TXTEST") && (now - last_txtest) >= 2000u) {
+            static const uint8_t d_probe[6] = {0x02,0,0,0,0,0x11};
+            static const uint8_t d_authf[6] = {0x02,0,0,0,0,0x22};
+            static const uint8_t d_auths[6] = {0x02,0,0,0,0,0x33};
+            printf("[txtest] fire: probe(->..11) auth160(->..22) authShort(->..33)\n");
+            send_probe_response(handle, mac, d_probe, ssid, channel, privacy);
+            send_auth_response(handle, mac, d_authf, 1, 2, 0, true);
+            send_auth_response(handle, mac, d_auths, 1, 2, 0, false);
+            last_txtest = now;
         }
         /* Occasionally re-arm the hardware beacon generator too, harmlessly. */
         if ((now - last_hw_refresh) >= 5000u) {
@@ -2450,7 +2788,10 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
             read16(handle, STA_CSR5, &sta5);
             read16(handle, TXRX_CSR19, &csr19);
             printf("[tsf] STA_CSR5 beacon-count=%u TXRX_CSR19=0x%04x\n", sta5, csr19);
-            send_beacon_and_enable(handle, mac, ssid, channel, on, off, privacy);
+            if (hw_beacon)
+                hw_load_beacon(handle, mac, ssid, channel, privacy, on, off);
+            else
+                send_beacon_and_enable(handle, mac, ssid, channel, on, off, privacy);
             last_hw_refresh = now;
         }
 #ifdef NWC_BACKEND_KMDF
@@ -2555,16 +2896,16 @@ int main(int argc, char **argv)
         privacy = false;
     }
 
-    printf("[init] command=%s KMDF backend via <path> (VID_%04X PID_%04X)\n",
+    printf("[init] command=%s KMDF backend via \\\\.\\NWCUSBAP (VID_%04X PID_%04X)\n",
            command, NWCUSB_VID, NWCUSB_PID);
-    g_kmdf = CreateFileA("<path>", GENERIC_READ | GENERIC_WRITE,
+    g_kmdf = CreateFileA("\\\\.\\NWCUSBAP", GENERIC_READ | GENERIC_WRITE,
                          0, NULL, OPEN_EXISTING, 0, NULL);
     if (g_kmdf == INVALID_HANDLE_VALUE) {
-        printf("[open] CreateFile(<path> failed gle=%lu; is nwcusbap.sys installed and started?\n",
+        printf("[open] CreateFile(\\\\.\\NWCUSBAP) failed gle=%lu; is nwcusbap.sys installed and started?\n",
                GetLastError());
         return 2;
     }
-    printf("[open] opened <path> (kernel continuous-reader RX active)\n");
+    printf("[open] opened \\\\.\\NWCUSBAP (kernel continuous-reader RX active)\n");
 
     libusb_device_handle *handle = (libusb_device_handle *)g_kmdf; /* opaque token; leaves use g_kmdf */
     int mrc = 0;

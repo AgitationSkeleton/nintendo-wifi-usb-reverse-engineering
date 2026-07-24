@@ -1,183 +1,162 @@
-# Nintendo Wi-Fi USB Connector — Reverse Engineering (Unfinished)
+# Nintendo Wi-Fi USB Connector — Reverse Engineering
 
-A near-complete reverse engineering and reimplementation of the **Nintendo Wi-Fi USB Connector**'s
-SoftAP stack for modern Windows — which gets a real Nintendo DS *almost* all the way online, and
-then stops at exactly one hardware behaviour we could never reproduce.
+A clean-room reverse engineering and reimplementation of the **Nintendo Wi-Fi USB Connector**'s
+SoftAP stack — which now gets a **real Nintendo DS fully online on the Wiimmfi revival service**,
+driving the original dongle entirely from **userspace on Linux** (no vendor driver, no Windows XP,
+no virtual machine).
 
-**This project does not work end-to-end. It is published as a detailed record of how far it got,
-what was proven, and precisely what is left.** If you are looking for a working solution today,
-see [Does anything work?](#does-anything-work) below.
+**This works end to end.** A DS finds the access point, completes the proprietary connector
+registration, authenticates (WEP shared-key), associates, gets an IP by DHCP, and its game traffic
+is bridged and NAT'd out to Wiimmfi — verified by the console reaching "Connection successful" and
+appearing in Wiimmfi's live matchmaking list.
+
+> This started as a Windows reimplementation that got *almost* all the way and stalled at what
+> looked like an unreproducible hardware behaviour. That turned out to be a **misdiagnosis**. Moving
+> to Linux with an over-the-air monitor made the real cause visible — it was a one-byte USB framing
+> quirk, not a hardware wall — and from there the whole path came together. The corrected story is
+> below.
 
 ---
 
 ## The hardware
 
 The Nintendo Wi-Fi USB Connector is a rebadged Buffalo USB Wi-Fi dongle built on the **Ralink
-RT2570** chipset (USB `VID 0x0411` / `PID 0x008B`). It is not a normal Wi-Fi adapter: bundled
+RT2570** chipset (USB `VID 0x0411` / `PID 0x008B`). It is not a normal Wi-Fi adapter: the bundled
 Windows XP-era software turns it into a **SoftAP** that speaks a small proprietary "registration"
 protocol, which a Nintendo DS recognises as an official connector and uses for Nintendo Wi-Fi
-Connection.
+Connection. The official software is long abandoned and does not run on modern systems.
 
-The official software is long abandoned and does not install or run on modern Windows. The goal
-here was a clean, modern Windows (10/11) replacement driving the same physical hardware.
+You also need, for the Linux path:
+- a Linux host with a wired uplink (a small NUC/box works well),
+- the RT2570 dongle (the connector itself),
+- optionally a second monitor-mode adapter (e.g. AR9271 / `ath9k_htc`) — invaluable for debugging,
+  and how the real cause was found.
 
 ---
 
-## Status: how close it got
-
-Everything in the connection sequence works **except the final hardware acknowledgement**:
+## Status: it works
 
 | Stage | Status |
 |---|---|
 | USB register surface (control-transfer register map) | ✅ fully reverse engineered |
-| Dongle bring-up: EEPROM, MAC/BBP/RF init, channel + antenna, AWAKE state machine | ✅ working |
-| Software beaconing | ✅ working |
-| **Hardware** beaconing (beacon-ring upload + `BEACON_GEN`, autonomous TBTT beacons) | ✅ working — DS discovers the AP from it |
-| Proprietary connector **registration / permission-grant** handshake | ✅ fully reverse engineered and reimplemented — the DS is admitted |
-| WEP shared-key auth: challenge, hardware key programming, RC4/CRC32, `seq2`/`seq4` | ✅ implemented, DS accepts our `seq2` |
-| Association request/response | ✅ implemented |
-| **802.11 SIFS auto-ACK of the DS's auth `seq1`** | ❌ **never fires — this is the blocker** |
-| DHCP / NAT / internet path for the DS | ⛔ never reached |
-
-A real DS **finds the AP, completes the registration handshake, is granted permission, and begins
-WEP authentication** — then stalls and reports **error 51303**.
+| Dongle bring-up: EEPROM, MAC/BBP/RF init, channel + antenna, AWAKE state machine | ✅ |
+| Software beaconing (discovery) | ✅ |
+| Proprietary connector **registration / permission-grant** handshake | ✅ reimplemented — DS admitted |
+| WEP shared-key auth (`seq1`→`seq2`→`seq3`→`seq4`, RC4/CRC32, HW key programming) | ✅ DS authenticates |
+| Association | ✅ |
+| **802.11 SIFS auto-ACK of the DS's auth `seq1`** | ✅ fires in hardware (verified over the air) |
+| **Data bridge**: DS data ⇄ TAP ⇄ DHCP + NAT (software WEP) | ✅ |
+| **DS fully online on Wiimmfi** (DHCP, DNS, conntest, NAS login) | ✅ **verified** |
 
 ---
 
-## Why it failed
+## How it works, end to end
 
-### The blocker in one paragraph
+The Linux program (`src/probe/nwcusb_probe.c`) opens the dongle over **libusb** and acts as the
+whole access point in userspace:
 
-When the DS transmits its authentication frame (`seq1`), the access point's MAC must reply with an
-802.11 ACK roughly **10 microseconds** later (one SIFS). This is emitted **autonomously by the
-RT2570's MAC hardware** — no software can do it, because 10 µs is orders of magnitude below any
-USB round-trip or interrupt latency. Whether it happens is purely a function of how the chip's
-registers are configured. **We were never able to get that auto-responder to fire.** The DS,
-seeing no acknowledgement, retransmits `seq1` (Retry bit set), never advances, and times out.
+1. **Bring-up & beacon** — initialises the RT2570 (EEPROM/MAC/BBP/RF, channel, antenna) and beacons
+   the connector SSID so the DS discovers it.
+2. **Connector grant** — answers the DS's proprietary registration probe with the permission-grant
+   reply, so the DS treats the dongle as an official Nintendo connector.
+3. **WEP auth & association** — derives the connector's WEP key from the SSID, programs the hardware
+   key, and completes shared-key authentication (`seq2` challenge / `seq4` success) and association.
+4. **Data bridge** (`NWC_DATAPATH=1`) — attaches a **TAP** interface and bridges the DS's traffic:
+   received data frames are WEP-decrypted (the RT2570 decrypts in place; the code reads the
+   hardware plaintext) and written to the TAP as Ethernet; replies from the TAP are re-framed as
+   802.11, **software WEP-encrypted**, and transmitted back to the DS.
+5. **Internet / Wiimmfi** — on the Linux side, `dnsmasq` serves DHCP on the TAP (handing out the
+   public Wiimmfi DNS) and `iptables` MASQUERADEs the DS's traffic out the wired uplink. The DS's
+   DNS, connection test, and NAS login all reach Wiimmfi.
 
-### What was ruled out
-
-Each of these was implemented and tested against a real DS. All still produced 51303:
-
-- **Responder latency.** The entire 802.11 responder was moved into a kernel driver (from
-  user-mode). No change — correctly so, since the auto-ACK is below the software layer entirely.
-- **`TXRX_CSR19`** (TSF / beacon / `TBCN` / `BEACON_GEN`). Tested at the exact value the original
-  driver leaves set (`0x001d`), including the alternating enable "dance". No change.
-- **RX filter (`TXRX_CSR2`, incl. `DROP_NOT_TO_ME`).** Matches the original byte-for-byte. A
-  theory that the original ran promiscuously was tested and disproven.
-- **Auto-responder control (`TXRX_CSR10`)**, auto-responder rate map (`TXRX_CSR5-8`), timing
-  registers (slot / **SIFS** / EIFS), antenna configuration, BSSID/MAC registers — all match.
-- **The original driver's runtime loop.** It continuously re-asserts the slot/SIFS/EIFS timing
-  registers after init; replicating that changed nothing.
-- **A genuinely radiating hardware beacon.** The theory that the auto-responder only arms once the
-  hardware TSF/beacon engine is truly running was the most promising lead. We eventually *did* get
-  a real hardware beacon radiating (the DS discovers and authenticates against it) — and the
-  auto-ACK *still* did not fire.
-
-### A correction worth recording
-
-An early assumption was that "the DS retransmits `seq1` with the Retry bit" *is* the failure
-signature. Decoding a USB capture of the **original driver working** showed the DS retransmits
-`seq1` there too (roughly seven times). The real difference is that in the working case it then
-**advances to `seq3`**. So the correct failure signature is *"never reaches `seq3`"*, not
-*"retransmits `seq1`"*.
-
-### Why we could not diagnose further
-
-The auto-ACK is generated **inside the chip's MAC and never crosses the USB bus**. Therefore no USB
-capture can show it — including captures of the original driver succeeding. From the host side,
-these two situations are **indistinguishable** but need opposite fixes:
-
-1. The auto-responder is disarmed and no ACK is transmitted at all.
-2. An ACK *is* transmitted, but the DS cannot decode it (wrong rate, preamble, or timing).
-
-Separating them requires an **over-the-air monitor-mode capture** during a DS authentication
-attempt. That hardware was not available, so the investigation stopped there rather than guessing
-between two opposite fixes.
+One command brings the whole thing up: [`linux/start-datapath.sh`](linux/start-datapath.sh).
 
 ---
 
-## What this project accomplishes
+## The corrected story (what actually blocked it, and the fixes)
 
-Even unfinished, the useful results are:
+Three findings turned "almost" into "working":
 
-- **A complete, documented register-level map** of driving an RT2570 as a SoftAP over USB —
-  bring-up, PHY/RF/BBP programming, beaconing, WEP key programming, and the TX/RX descriptor
-  formats.
-- **A full reimplementation of the proprietary connector registration protocol** — the piece that
-  makes a DS treat the dongle as an official Nintendo connector. This is the part with no public
-  documentation, and it works.
-- **A working hardware beacon path** on the RT2570 over USB (beacon-ring upload with the guardian
-  byte, plus the `BEACON_GEN` enable sequence), including the discovery that a software beacon and
-  the hardware beacon collide on the chip's single TX engine.
-- **Two complete implementations** to build on: a user-mode SoftAP and a KMDF kernel driver with an
-  in-kernel 802.11 responder.
-- **A precise, evidence-backed statement of the one remaining unknown**, plus a list of hypotheses
-  already eliminated — so nobody has to re-walk them.
+**1. The auto-ACK was never the problem — a one-byte USB guardian was.**
+The long-standing theory was that the RT2570's ~10 µs SIFS auto-ACK of the DS's `seq1` never fired.
+An over-the-air monitor capture of our *own* access point disproved it: **the hardware auto-ACK
+fires every time.** The real wall was that our `seq2` auth-response never left the antenna. Decoding
+the original driver's USB capture showed why: we prepended a **1-byte "guardian" transfer to every
+frame**, but the original driver guardians **only the beacon** — data and management frames
+(including `seq2`) are sent as a bare bulk transfer. Sending the guardian before `seq2` derailed
+that transmit. Guardian-beacons-only → `seq2` radiates → the DS authenticates and associates.
+
+**2. Received data is already hardware-decrypted.**
+The RT2570 WEP-decrypts received frames *in place*; the plaintext sits just past the IV/key-id.
+Software-decrypting it again produced ICV mismatches. The bridge reads the hardware plaintext
+directly (with a software-decrypt fallback).
+
+**3. A 512-byte transmit cap was silently dropping the connection-test response.**
+The transmit path rejected frames over 512 bytes, so the ~536-byte HTTP connection-test reply never
+reached the DS — the console held "green" for the whole test and failed only at the very last step.
+Raising the cap fixed it, and the DS completes.
+
+The over-the-air monitor adapter was the key tool: it made the difference between "no ACK on air"
+and "ACK on air, ignored" observable, which is what redirected the whole investigation.
+
+---
+
+## Quick start (Linux)
+
+```sh
+# 1. Build the userspace probe (needs gcc + libusb-1.0 dev headers)
+cd src/probe && ./build.sh
+
+# 2. Bring up the full path as root (frees the dongle from the kernel driver,
+#    sets up the TAP + dnsmasq DHCP + NAT, starts the probe with the data bridge).
+#    Edit the interface names / uplink at the top of the script for your machine first.
+sudo linux/start-datapath.sh
+
+# 3. On the DS: Nintendo WFC Setup -> Connect to your Nintendo Wi-Fi USB Connector -> test.
+```
+
+The bring-up script's runtime state (TAP, dnsmasq, NAT) is not reboot-persistent — re-run it after
+a reboot. See [docs/LINUX_PIPELINE.md](docs/LINUX_PIPELINE.md) for the full account and the
+`NWC_*` tuning knobs.
 
 ---
 
 ## Repository layout
 
 ```
-src/probe/    user-mode SoftAP implementation (the bulk of the reverse engineering)
-src/driver/   KMDF kernel driver + in-kernel 802.11 responder, build/sign scripts
+src/probe/    userspace SoftAP + connector protocol + data bridge (the core; builds on Linux and Windows)
+src/driver/   an alternative KMDF kernel driver + in-kernel 802.11 responder (Windows path)
+linux/        the Linux pipeline: one-shot bring-up, NUC setup, sniffer, and analysis tools
 tools/        decoder for USB captures (usbmon-format pcapng) into a register/frame timeline
 docs/         documentation (below)
 ```
 
 | Document | Contents |
 |---|---|
-| [docs/BUILDING.md](docs/BUILDING.md) | Prerequisites (MSVC / SDK / WDK / libusb header), build steps, test-signing, and the USB-controller requirement when virtualising the dongle. |
-| [docs/USAGE.md](docs/USAGE.md) | Installing the driver, the probe's commands, the **~20 environment-variable tuning knobs** used to test hypotheses without rebuilding, the offline driver harness, and how to read the client error codes. |
-| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Register map, bring-up ordering, TX/RX descriptor formats, the hardware beacon-ring mechanism, the connector registration protocol, WEP auth, and the auto-ACK analysis. |
-| [docs/reference/original-driver-init-sequence.txt](docs/reference/original-driver-init-sequence.txt) | Our decoded ~3,680-step register/USB init sequence of the **original vendor driver** — the ground truth this implementation was compared against. |
-
-Build scripts target the Windows WDK/SDK and MSVC. The kernel driver requires test-signing to load
-— **use a throwaway VM**, not a machine you care about.
-
-If you are picking this up, the fastest orientation is: `docs/USAGE.md` (the tuning knobs) →
-`docs/TECHNICAL.md` §7 (the unresolved blocker) → the reference init sequence.
-
----
-
-## If you want to pick this up
-
-The single highest-value experiment: **capture the air with a monitor-mode adapter while a DS
-attempts to authenticate**, and answer one question — *does an ACK appear after the DS's `seq1`?*
-
-- **No ACK on air** → the auto-responder is disarmed; keep hunting chip state.
-- **ACK on air, DS ignores it** → it is a rate/preamble/timing mismatch on the ACK frame, which is
-  a different and likely tractable problem.
-
-Almost any monitor-capable adapter (or a Linux live USB) is sufficient. Everything else needed to
-reproduce the setup is in this repository.
-
----
-
-## Does anything work?
-
-Yes — but not this code. The **original Windows XP software, run inside a virtual machine** with
-the dongle passed through, still works and can get a DS online against community revival servers.
-That remains the practical solution today. This project was an attempt to replace it natively, and
-it did not get there.
+| [docs/LINUX_PIPELINE.md](docs/LINUX_PIPELINE.md) | The full narrative: the guardian-byte breakthrough, the data bridge, and the fixes that got the DS online. |
+| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Register map, bring-up ordering, TX/RX descriptor formats, connector registration, WEP auth. |
+| [docs/rt2500usb-beacon-notes.md](docs/rt2500usb-beacon-notes.md) | Annotated upstream `rt2500usb` beacon/guardian mechanism (the reference that explained the guardian). |
+| [docs/BUILDING.md](docs/BUILDING.md) · [docs/USAGE.md](docs/USAGE.md) | Windows build + the ~20 `NWC_*` tuning knobs and client error codes. |
+| [docs/reference/original-driver-init-sequence.txt](docs/reference/original-driver-init-sequence.txt) | Decoded ~3,680-step register/USB init of the **original vendor driver** — the ground truth. |
+| [linux/analysis/README.md](linux/analysis/README.md) | The usbmon register-diff and over-the-air sniff tools used throughout. |
 
 ---
 
 ## Scope, legality, and attribution
 
 - This repository contains **only original code and observations**. No vendor drivers, firmware,
-  executables, installers, or packet captures are included or redistributed.
+  executables, installers, or packet captures are included or redistributed. (The analysis tools
+  reference captures that are **not** published — they contain personal network data.)
 - Reverse engineering here was for **interoperability** with hardware that is out of support, with
   no official software available for current operating systems.
 - Personal identifiers (hardware addresses, console nicknames, machine names, network details) have
-  been removed; MAC addresses in the source are non-routable placeholders, and the real values are
-  read from the dongle's EEPROM at runtime.
+  been removed; MAC/IP values in the source and scripts are non-routable placeholders — replace them
+  with your own, and the dongle's real MAC is read from its EEPROM at runtime.
 - *Nintendo*, *Nintendo DS*, and *Nintendo Wi-Fi Connection* are trademarks of Nintendo. *Buffalo*
   and *Ralink*/*MediaTek* are trademarks of their respective owners. Used nominatively for
   identification only. This project is **not affiliated with, endorsed by, or supported by** any of
   them.
 - Nintendo's official Wi-Fi Connection service was discontinued in 2014; this work targets
-  community-run revival servers.
+  community-run revival servers (Wiimmfi).
 
 Licensed under the MIT License — see [LICENSE](LICENSE).
