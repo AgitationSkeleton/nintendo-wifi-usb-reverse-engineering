@@ -172,6 +172,27 @@ docs/         documentation (below)
 
 ---
 
+## Access control / security
+
+The connector bridges its client to the internet (NAT), so it only completes a handshake
+with a genuine Nintendo client, via two layers:
+
+- **Nintendo-only client allow-list (on by default).** The AP refuses to answer
+  probe/auth/assoc — and won't bridge traffic — for a MAC whose OUI isn't Nintendo
+  (**DS / DSi / 2DS / 3DS** handhelds and **Wii / Wii U**). Set `NWC_ANY_CLIENT=1` to
+  accept any client (e.g. a newer OUI not yet in the list); rejections are logged with
+  that hint.
+- **The proprietary connector handshake** is the real barrier: an ordinary Wi-Fi client
+  can *see* the beacon but its stack won't perform the Nintendo Wi-Fi USB Connector
+  registration + WEP shared-key exchange, so it can't associate.
+
+This is LAN-side access control, **not a cryptographic guarantee** — MAC OUIs are
+spoofable and the connector's WEP is the original weak scheme (kept for authenticity;
+the connector historically accepted the shared-key exchange without verifying it). Treat
+the host like any NAT gateway and keep it on a network you trust.
+
+---
+
 ## Scope, legality, and attribution
 
 - This repository contains **only original code and observations**. No vendor drivers, firmware,

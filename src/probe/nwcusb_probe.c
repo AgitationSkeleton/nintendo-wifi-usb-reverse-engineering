@@ -193,6 +193,40 @@ static bool mac_broadcast(const uint8_t a[6])
     return mac_equal(a, bc);
 }
 
+/* Is this MAC's OUI registered to Nintendo? Covers the DS / DSi / 2DS / 3DS handheld
+ * families and the Wii / Wii U (which use the same connector/WFC path). Used as an
+ * optional client allow-list so the AP only handshakes with genuine Nintendo systems.
+ * NOTE: an OUI check is defense-in-depth only -- MAC addresses are spoofable, so this
+ * stops casual/accidental non-Nintendo clients, not a determined attacker. The real
+ * gate is the proprietary connector registration + WEP-shared-key handshake, which
+ * ordinary Wi-Fi clients do not speak. This list is not exhaustive (Nintendo holds
+ * 100+ OUIs); NWC_ANY_CLIENT=1 disables the check if a legitimate unit is rejected. */
+static bool is_nintendo_mac(const uint8_t m[6])
+{
+    static const uint32_t oui[] = {
+        0x0009BF,0x001656,0x0017AB,0x00191D,0x0019FD,0x001AE9,0x001B7A,0x001BEA,
+        0x001CBE,0x001DBC,0x001E35,0x001F32,0x001FC5,0x002147,0x0021BD,0x00224C,
+        0x0022AA,0x0022D7,0x002331,0x0023CC,0x00241E,0x002444,0x0024F3,0x0025A0,
+        0x002659,0x002709,0x0403D6,0x182A7B,0x2C10C1,0x34AF2C,0x40D28A,0x40F407,
+        0x58BDA3,0x5C521E,0x606BFF,0x64B5C6,0x78A2A0,0x7CBB8A,0x8C56C5,0x98415C,
+        0x98B6E9,0x9CE635,0xA438CC,0xA45C27,0xA4C0E1,0xB88AEC,0xB8AE6E,0xCC9E00,
+        0xCCFB65,0xD86BF7,0xDC68EB,0xE00C7F,0xE0E751,0xE84ECE,0xE8DA20,0xECC40D
+    };
+    uint32_t o = ((uint32_t)m[0] << 16) | ((uint32_t)m[1] << 8) | m[2];
+    for (unsigned i = 0; i < sizeof(oui)/sizeof(oui[0]); i++)
+        if (oui[i] == o) return true;
+    return false;
+}
+
+/* Enforce the Nintendo-only client allow-list? On by default; NWC_ANY_CLIENT=1 turns
+ * it off (accept any client that speaks the connector protocol, like the original). */
+static bool nintendo_only(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("NWC_ANY_CLIENT"); v = (e && *e && *e != '0') ? 0 : 1; }
+    return v;
+}
+
 static bool contains_ascii_nocase(const uint8_t *data, int len, const char *needle)
 {
     size_t n = strlen(needle);
@@ -1954,6 +1988,7 @@ static void win_rx_dsdata(libusb_device_handle *h, const uint8_t *frame, int fra
     uint16_t et = (uint16_t)((plain[6]<<8)|plain[7]);
     const uint8_t *pay = plain + 8; int paylen = plain_len - 8;
     g_last_ds_rx = GetTickCount();                      /* the DS is alive; keep the bridge open */
+    if (nintendo_only() && !is_nintendo_mac(ds_mac)) return;   /* only bridge for a genuine Nintendo client */
     if (!g_sta_known){ memcpy(g_sta_mac, ds_mac, 6); g_sta_known=1;
         printf("[bridge] learned DS station %02x:%02x:%02x:%02x:%02x:%02x\n",
                ds_mac[0],ds_mac[1],ds_mac[2],ds_mac[3],ds_mac[4],ds_mac[5]);
@@ -2751,6 +2786,20 @@ static void maybe_answer_management(libusb_device_handle *handle, const uint8_t 
         return;
 
     const uint8_t *src = frame + 10;
+
+    /* NINTENDO-ONLY CLIENT ALLOW-LIST (default on; NWC_ANY_CLIENT=1 disables).
+     * Refuse to answer probe/auth/assoc from a MAC whose OUI is not Nintendo, so the
+     * AP only completes a handshake with a genuine DS/DSi/2DS/3DS or Wii/Wii U. This is
+     * defense-in-depth (MACs are spoofable); the real gate is the proprietary connector
+     * registration + WEP handshake that ordinary Wi-Fi clients cannot perform. */
+    if (nintendo_only() && !mac_broadcast(src) && !is_nintendo_mac(src)) {
+        static unsigned long g_rej = 0;
+        if ((++g_rej & 0x3f) == 1)
+            printf("[security] ignoring non-Nintendo client %02x:%02x:%02x:%02x:%02x:%02x "
+                   "(OUI not Nintendo; NWC_ANY_CLIENT=1 to allow) [x%lu]\n",
+                   src[0],src[1],src[2],src[3],src[4],src[5], g_rej);
+        return;
+    }
 
     /* ACTIVE-CONNECTION GUARD (Windows crash fix): once a DS is associated and
      * we're bridging its data (g_sta_known), IGNORE management frames from any
