@@ -214,7 +214,91 @@ static void usage(void) {
       "  nwc-connector.exe                      run the connector\n"
       "  nwc-connector.exe --install-autostart  start automatically at every logon\n"
       "  nwc-connector.exe --uninstall-autostart remove the autostart task\n"
-      "  nwc-connector.exe --help               this text\n");
+      "  nwc-connector.exe --help               this text\n"
+      "\n"
+      "Settings live in nwc-connector.conf next to the exe (KEY=VALUE lines).\n"
+      "Logs (capped + rotated) are written to the logs\\ folder next to the exe.\n");
+}
+
+/* ---------------------------------------------------------- config + logs */
+
+/* Directory that CONTAINS nwc-connector.exe (where nwc-connector.conf + logs\ live,
+ * separate from the extracted-payload runtime dir under %LOCALAPPDATA%). */
+static void exe_dir(char *out, size_t n) {
+    GetModuleFileNameA(NULL, out, (DWORD)n);
+    char *s = strrchr(out, '\\'); if (s) *s = 0;
+}
+
+/* Load KEY=VALUE lines from nwc-connector.conf into the environment (overriding the
+ * built-in defaults). '#'/';'/blank lines ignored. This is how the user toggles
+ * settings such as NWC_ANY_CLIENT without editing or rebuilding anything. */
+static void load_config(const char *edir) {
+    char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\nwc-connector.conf", edir);
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("[nwc] no nwc-connector.conf found (using built-in defaults)\n"); return; }
+    char line[512]; int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\r' || *p == '\n' || *p == 0) continue;
+        char *eq = strchr(p, '='); if (!eq) continue;
+        *eq = 0; char *key = p; char *val = eq + 1;
+        char *ke = key + strlen(key); while (ke > key && (ke[-1]==' '||ke[-1]=='\t')) *--ke = 0;
+        while (*val == ' ' || *val == '\t') val++;
+        char *ve = val + strlen(val); while (ve > val && (ve[-1]=='\r'||ve[-1]=='\n'||ve[-1]==' '||ve[-1]=='\t')) *--ve = 0;
+        if (*key) { SetEnvironmentVariableA(key, val); n++; }
+    }
+    fclose(f);
+    printf("[nwc] loaded %d setting(s) from nwc-connector.conf\n", n);
+}
+
+/* Rotating log: the probe's output is tee'd to the console AND to logs\connector_*.log,
+ * a new file every LOG_ROLL_BYTES, with the folder pruned to LOG_TOTAL_CAP so it can
+ * never fill the drive on a 24/7 box. */
+#define LOG_ROLL_BYTES  (20L*1024*1024)   /* start a new file every ~20 MB   */
+#define LOG_TOTAL_CAP   (200L*1024*1024)  /* keep logs\ under ~200 MB total  */
+static char  g_logdir[MAX_PATH];
+static FILE *g_logf = NULL;
+static long  g_logbytes = 0;
+
+static void log_prune(void) {
+    char pat[MAX_PATH]; snprintf(pat, sizeof(pat), "%s\\connector_*.log", g_logdir);
+    struct { FILETIME t; char name[MAX_PATH]; long sz; int live; } it[512]; int ni = 0; long total = 0;
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (ni < 512) { it[ni].t = fd.ftLastWriteTime; it[ni].sz = (long)fd.nFileSizeLow; it[ni].live = 1;
+                snprintf(it[ni].name, MAX_PATH, "%s\\%s", g_logdir, fd.cFileName); total += it[ni].sz; ni++; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    while (total > LOG_TOTAL_CAP) {
+        int o = -1;
+        for (int i = 0; i < ni; i++) if (it[i].live && (o < 0 || CompareFileTime(&it[i].t, &it[o].t) < 0)) o = i;
+        if (o < 0) break;
+        DeleteFileA(it[o].name); total -= it[o].sz; it[o].live = 0;
+    }
+}
+
+static void log_open_new(void) {
+    if (g_logf) { fclose(g_logf); g_logf = NULL; }
+    log_prune();
+    SYSTEMTIME st; GetLocalTime(&st);
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\connector_%04d%02d%02d_%02d%02d%02d.log",
+             g_logdir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    g_logf = fopen(path, "wb"); g_logbytes = 0;
+}
+
+static DWORD WINAPI log_reader(LPVOID param) {
+    HANDLE rd = (HANDLE)param; char buf[4096]; DWORD nr;
+    while (ReadFile(rd, buf, sizeof(buf), &nr, NULL) && nr > 0) {
+        fwrite(buf, 1, nr, stdout); fflush(stdout);                    /* live console */
+        if (g_logf) {
+            fwrite(buf, 1, nr, g_logf); fflush(g_logf);
+            g_logbytes += (long)nr;
+            if (g_logbytes >= LOG_ROLL_BYTES) log_open_new();          /* rotate */
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -259,26 +343,51 @@ int main(int argc, char **argv) {
     SetEnvironmentVariableA("NWC_RX_DRAIN", "24");
     SetEnvironmentVariableA("NWC_DATA_TXPOWER", "0");
     SetEnvironmentVariableA("NWC_WD_DRAIN", "24");
+    SetEnvironmentVariableA("NWC_QUIET", "1");   /* clean, low-volume log by default */
 
-    char probe[MAX_PATH];
-    snprintf(probe, sizeof(probe), "\"%s\\nwcusb_probe.exe\" ap-loop 1", dir);
+    /* user overrides from nwc-connector.conf next to the exe (e.g. NWC_ANY_CLIENT=1) */
+    char edir[MAX_PATH]; exe_dir(edir, sizeof(edir));
+    load_config(edir);
 
-    STARTUPINFOA si = {0}; si.cb = sizeof(si);
-    printf("[nwc] starting probe: %s\n", probe);
-    char cmdbuf[MAX_PATH + 32]; strncpy(cmdbuf, probe, sizeof(cmdbuf) - 1); cmdbuf[sizeof(cmdbuf)-1]=0;
-    if (!CreateProcessA(NULL, cmdbuf, NULL, NULL, TRUE, 0, NULL, dir, &si, &g_probe))
-        die("failed to start nwcusb_probe.exe");
+    /* rotating, size-capped logs next to the exe (can never fill the drive) */
+    snprintf(g_logdir, sizeof(g_logdir), "%s\\logs", edir);
+    CreateDirectoryA(g_logdir, NULL);
+    log_open_new();
+    printf("[nwc] logging to %s (capped + rotated)\n", g_logdir);
 
-    /* Give the probe time to init the dongle + create the Wintun adapter, then
-     * configure the adapter IP and NAT. (The probe streams its own log here.) */
-    Sleep(9000);
-    configure_network(dir);
-    printf("[nwc] up. Scan for the connector from the DS. Ctrl+C to stop.\n");
+    /* 24/7: run the probe, tee its output to this console AND the log, restart on exit. */
+    for (;;) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        HANDLE rd = NULL, wr = NULL;
+        if (!CreatePipe(&rd, &wr, &sa, 0)) die("CreatePipe failed");
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);   /* keep our read end private */
 
-    WaitForSingleObject(g_probe.hProcess, INFINITE);
-    DWORD code = 0; GetExitCodeProcess(g_probe.hProcess, &code);
-    CloseHandle(g_probe.hProcess); CloseHandle(g_probe.hThread);
-    printf("[nwc] probe exited (code %lu). Removing NAT.\n", code);
-    teardown_nat();
-    return (int)code;
+        char probe[MAX_PATH];
+        snprintf(probe, sizeof(probe), "\"%s\\nwcusb_probe.exe\" ap-loop 1", dir);
+        char cmdbuf[MAX_PATH + 32]; strncpy(cmdbuf, probe, sizeof(cmdbuf) - 1); cmdbuf[sizeof(cmdbuf)-1] = 0;
+        STARTUPINFOA si = {0}; si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        printf("[nwc] starting probe ...\n");
+        if (!CreateProcessA(NULL, cmdbuf, NULL, NULL, TRUE, 0, NULL, dir, &si, &g_probe)) {
+            CloseHandle(rd); CloseHandle(wr); die("failed to start nwcusb_probe.exe");
+        }
+        CloseHandle(wr);   /* the probe now owns the only write end */
+        HANDLE th = CreateThread(NULL, 0, log_reader, rd, 0, NULL);
+
+        /* let the probe init the dongle + create the Wintun adapter, then set IP + NAT */
+        Sleep(9000);
+        configure_network(dir);
+        printf("[nwc] up. On the DS: connect to your Nintendo Wi-Fi USB Connector. Ctrl+C to stop.\n");
+
+        WaitForSingleObject(g_probe.hProcess, INFINITE);
+        DWORD code = 0; GetExitCodeProcess(g_probe.hProcess, &code);
+        CloseHandle(g_probe.hProcess); CloseHandle(g_probe.hThread); g_probe.hProcess = NULL;
+        if (th) { WaitForSingleObject(th, 3000); CloseHandle(th); }
+        CloseHandle(rd);
+        printf("[nwc] probe exited (code %lu) - removing NAT, restarting in 4s (Ctrl+C to quit)\n", code);
+        teardown_nat();
+        Sleep(4000);
+    }
+    /* not reached */
 }

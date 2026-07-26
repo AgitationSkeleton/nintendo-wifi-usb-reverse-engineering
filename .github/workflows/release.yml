@@ -79,17 +79,20 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item build\nwc-connector.exe out\
+          Copy-Item windows\nwc-connector.conf out\
           Copy-Item windows\install-driver.cmd out\
           Copy-Item windows\README.txt out\ -ErrorAction SilentlyContinue
           Compress-Archive -Path out\* -DestinationPath nwc-connector-windows-x64.zip -Force
-          # the single self-contained exe is also published on its own
+          # the single self-contained exe + its config are also published on their own
           Copy-Item build\nwc-connector.exe nwc-connector.exe
+          Copy-Item windows\nwc-connector.conf nwc-connector.conf
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             nwc-connector.exe
+            nwc-connector.conf
             nwc-connector-windows-x64.zip
 
   # ------------------------------------------------------------------ Linux
@@ -139,6 +142,7 @@ jobs:
         with:
           files: |
             dist/windows/nwc-connector.exe
+            dist/windows/nwc-connector.conf
             dist/windows/nwc-connector-windows-x64.zip
             dist/linux/nwc-connector-linux-x86_64.tar.gz
           generate_release_notes: true

@@ -1055,6 +1055,7 @@ static int env_on(const char *name) {
     const char *v = getenv(name);
     return v && *v && strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0;
 }
+static int nwc_quiet(void);   /* fwd decl: defined below, used by the TX/heartbeat log gates above it */
 
 /* ---------------- Async TX pool (non-blocking bulk-OUT) ----------------------------------------
  * The blocking libusb_bulk_transfer serialises the main loop during a DS data burst on libusbK,
@@ -1299,7 +1300,7 @@ static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
     }
     rc = libusb_bulk_transfer(handle, BULK_OUT_EP, packet, transfer_len, &transferred, (unsigned)txto);
     if (rc != 0) { printf("[tx] %s frame failed (noguard=%d): %s\n", label, noguard, libusb_error_name(rc)); return rc; }
-    if (strcmp(label, "beacon") != 0 || VERBOSE_USB_REG)
+    if (VERBOSE_USB_REG || (strcmp(label, "beacon") != 0 && !(nwc_quiet() && strstr(label, "beacon") != NULL)))
         printf("[tx] %s sent: %d bytes (noguard=%d)\n", label, transferred, noguard);
     return 0;
 #endif
@@ -4036,10 +4037,20 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
                  * blocking), not real RF. g_loop_max = worst single main-loop iteration since last read. */
                 unsigned long dt = nrt - last_rt;
                 extern volatile unsigned long g_loop_max;
-                printf("[stacsr] FCS=%u PLCP=%u LONG=%u CCA=%u RXFIFO=%u BCN=%u dt=%lums loopmax=%lums CCA/150ms=%lu\n",
-                       s[0],s[1],s[2],s[3],s[4],s[5], dt, g_loop_max,
-                       dt ? (unsigned long)((unsigned long long)s[3]*150ull/dt) : (unsigned long)s[3]);
-                g_loop_max = 0;
+                /* Heartbeat is spam at 150ms cadence. In quiet mode (the default for the
+                 * all-in-one launcher) print it only every ~10s so the rotating log grows
+                 * slowly; g_loop_max keeps accumulating across the suppressed intervals so
+                 * the printed worst-case still covers the whole 10s window. The CCA read +
+                 * stall auto-recovery below keep running every interval regardless. */
+                { static unsigned long last_stacsr_print = 0;
+                  unsigned long pnow = GetTickCount();
+                  if (!nwc_quiet() || (pnow - last_stacsr_print) >= 10000) {
+                      last_stacsr_print = pnow;
+                      printf("[stacsr] FCS=%u PLCP=%u LONG=%u CCA=%u RXFIFO=%u BCN=%u dt=%lums loopmax=%lums CCA/150ms=%lu\n",
+                             s[0],s[1],s[2],s[3],s[4],s[5], dt, g_loop_max,
+                             dt ? (unsigned long)((unsigned long long)s[3]*150ull/dt) : (unsigned long)s[3]);
+                      g_loop_max = 0;
+                  } }
                 last_rt = nrt;
                 /* Stall detection + auto-recovery. s[5]=STA_CSR5 is the beacon-sent counter and this
                  * block is now its only reader, so several consecutive zero intervals is a genuine
