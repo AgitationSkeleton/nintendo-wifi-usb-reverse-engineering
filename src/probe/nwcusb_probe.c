@@ -490,8 +490,6 @@ static uint16_t eeprom_word(const uint8_t *eeprom, uint16_t word_index)
 
 static int read_eeprom(libusb_device_handle *handle, uint8_t *eeprom, uint16_t length)
 {
-    static const uint8_t fallback_mac[6] = { 0x00, 0x16, 0x01, 0x78, 0x74, 0x21 };
-
     memset(eeprom, 0, length);
     for (int attempt = 1; attempt <= 3; attempt++) {
         int rc = vendor_read(handle, USB_EEPROM_READ, 0, eeprom, length, "eeprom");
@@ -504,10 +502,35 @@ static int read_eeprom(libusb_device_handle *handle, uint8_t *eeprom, uint16_t l
     }
 
     if (length >= 10) {
-        memcpy(eeprom + 4, fallback_mac, sizeof(fallback_mac));
-        printf("[eeprom] using cached fallback MAC %02x:%02x:%02x:%02x:%02x:%02x; BBP EEPROM overrides disabled\n",
-               fallback_mac[0], fallback_mac[1], fallback_mac[2],
-               fallback_mac[3], fallback_mac[4], fallback_mac[5]);
+        /* MAC-AGNOSTIC fallback (no hardcoded device MAC): the RT2570's USB iSerialNumber string
+         * descriptor IS this dongle's MAC (e.g. "001601787421" / "00160177A3EB"), so read it and use
+         * whatever unit is plugged in. Works for any 0411:008b dongle; nothing device-specific baked in. */
+        uint8_t mac[6]; int got = 0;
+        libusb_device *dev = libusb_get_device(handle);
+        struct libusb_device_descriptor dd;
+        if (dev && libusb_get_device_descriptor(dev, &dd) == 0 && dd.iSerialNumber) {
+            unsigned char ser[64] = { 0 };
+            int sl = libusb_get_string_descriptor_ascii(handle, dd.iSerialNumber, ser, (int)sizeof ser - 1);
+            if (sl >= 12) {
+                int ok = 1;
+                for (int i = 0; i < 6; i++) {
+                    unsigned v;
+                    if (sscanf((const char *)ser + i * 2, "%2x", &v) == 1) mac[i] = (uint8_t)v;
+                    else { ok = 0; break; }
+                }
+                got = ok;
+            }
+        }
+        if (!got) {
+            /* last resort only if the serial is unreadable: a locally-administered address (bit1 of
+             * byte0 set) that is NOT any real device -- keeps the AP up without impersonating a unit. */
+            static const uint8_t la[6] = { 0x02, 0x16, 0x01, 0x00, 0x00, 0x01 };
+            memcpy(mac, la, 6);
+        }
+        memcpy(eeprom + 4, mac, 6);
+        printf("[eeprom] read failed; using %s MAC %02x:%02x:%02x:%02x:%02x:%02x; BBP EEPROM overrides disabled\n",
+               got ? "USB-serial" : "locally-administered",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         return 0;
     }
 
@@ -4022,7 +4045,7 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
                  * gaps the DS scan misses). NWC_FULL_STACSR restores the full dump for diagnosis. */
                 if (env_on("NWC_FULL_STACSR")) {
                     int k; for (k = 0; k < 11; k++) read16(handle, (uint16_t)(0x04e0 + k*2), &s[k]);
-                } else {
+                } else if (!env_on("NWC_NO_STACSR")) {
                     read16(handle, 0x04e6, &s[3]);   /* STA_CSR3 = CCA (always) */
                     /* Each read16 is a ~10ms libusbK SYNC control transfer that stalls the loop and
                      * jitters the beacon. During a LIVE connection we only need CCA (the diagnostic);
@@ -4032,6 +4055,13 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
                         read16(handle, 0x04ea, &s[5]);   /* STA_CSR5 = BCN   */
                     }
                 }
+                /* NWC_NO_STACSR (2026-07-26, server adaptation): skip the telemetry control-reads
+                 * entirely. They only feed the CCA tuner + auto-recovery, BOTH disabled on this box;
+                 * on a USB-congested host (28 game servers + storage) each read16 is a blocking
+                 * libusbK sync transfer that stalls the loop for hundreds of ms -> beacon dark ->
+                 * green->red. The Linux golden reference proved the "CCA saturation" is a fake
+                 * cleared-on-read artifact of exactly this stall, so losing the CCA telemetry costs
+                 * nothing real; loopmax is still printed below, and the [stall] lines still fire. */
                 /* dt = actual ms since last read. CCA is cleared-on-read, so a big dt inflates the
                  * count: if a "CCA spike" comes with dt >> rt_ms, it's a LOOP STALL (libusbK sync TX
                  * blocking), not real RF. g_loop_max = worst single main-loop iteration since last read. */
