@@ -1,0 +1,154 @@
+name: release
+
+# Builds the ready-to-run connector for Windows and Linux and publishes them as
+# a single GitHub Release. Push a tag like v1.0.0 (or run manually to smoke-test
+# the builds without publishing).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LIBUSB_VER: "1.0.27"
+  WINTUN_VER: "0.14.1"
+  WINDIVERT_VER: "2.2.2"
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (cl.exe / rc.exe)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch dependencies (libusb + Wintun)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dep | Out-Null
+          # libusb prebuilt (MSVC dll + import lib + header)
+          curl -L -o dep\libusb.7z "https://github.com/libusb/libusb/releases/download/v$env:LIBUSB_VER/libusb-$env:LIBUSB_VER.7z"
+          7z x dep\libusb.7z -odep\libusb | Out-Null
+          # Wintun (signed userspace TUN dll + header)
+          curl -L -o dep\wintun.zip "https://www.wintun.net/builds/wintun-$env:WINTUN_VER.zip"
+          7z x dep\wintun.zip -odep\wintun | Out-Null
+          # WinDivert (signed userspace NAT: dll + kernel sys + import lib + header)
+          curl -L -o dep\windivert.zip "https://github.com/basil00/WinDivert/releases/download/v$env:WINDIVERT_VER/WinDivert-$env:WINDIVERT_VER-A.zip"
+          7z x dep\windivert.zip -odep\windivert | Out-Null
+
+      - name: Stage build inputs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Copy-Item src\probe\nwcusb_probe.c build\
+          Copy-Item windows\nwc-connector.c, windows\nwc-connector.rc, windows\resource.h build\
+          # locate libusb artifacts (path varies by toolset folder inside the 7z)
+          $dll = Get-ChildItem dep\libusb -Recurse -Filter libusb-1.0.dll | Where-Object FullName -match 'MS64' | Select-Object -First 1
+          $lib = Get-ChildItem dep\libusb -Recurse -Filter libusb-1.0.lib | Where-Object FullName -match 'MS64' | Select-Object -First 1
+          $hdr = Get-ChildItem dep\libusb -Recurse -Filter libusb.h | Select-Object -First 1
+          Copy-Item $dll.FullName build\libusb-1.0.dll
+          Copy-Item $lib.FullName build\libusb-1.0.lib
+          Copy-Item $hdr.FullName build\libusb.h
+          # Wintun dll (amd64) + header
+          Copy-Item (Get-ChildItem dep\wintun -Recurse -Filter wintun.dll | Where-Object FullName -match 'amd64' | Select-Object -First 1).FullName build\wintun.dll
+          Copy-Item (Get-ChildItem dep\wintun -Recurse -Filter wintun.h | Select-Object -First 1).FullName build\wintun.h
+          # WinDivert x64: dll + kernel sys + import lib + header
+          Copy-Item (Get-ChildItem dep\windivert -Recurse -Filter WinDivert.dll   | Where-Object FullName -match 'x64' | Select-Object -First 1).FullName build\WinDivert.dll
+          Copy-Item (Get-ChildItem dep\windivert -Recurse -Filter WinDivert64.sys | Where-Object FullName -match 'x64' | Select-Object -First 1).FullName build\WinDivert64.sys
+          Copy-Item (Get-ChildItem dep\windivert -Recurse -Filter WinDivert.lib   | Where-Object FullName -match 'x64' | Select-Object -First 1).FullName build\WinDivert.lib
+          Copy-Item (Get-ChildItem dep\windivert -Recurse -Filter windivert.h     | Select-Object -First 1).FullName build\windivert.h
+          Get-ChildItem build | Format-Table Name,Length
+
+      - name: Build probe + all-in-one launcher
+        shell: cmd
+        working-directory: build
+        run: |
+          cl.exe /nologo /W3 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /I . nwcusb_probe.c /Fe:nwcusb_probe.exe /link libusb-1.0.lib ws2_32.lib WinDivert.lib || exit /b 1
+          rc.exe /nologo nwc-connector.rc || exit /b 1
+          cl.exe /nologo /W3 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /I . nwc-connector.c nwc-connector.res /Fe:nwc-connector.exe /link advapi32.lib shell32.lib ole32.lib || exit /b 1
+          dir nwc-connector.exe
+
+      - name: Package Windows artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item build\nwc-connector.exe out\
+          Copy-Item windows\install-driver.cmd out\
+          Copy-Item windows\README.txt out\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path out\* -DestinationPath nwc-connector-windows-x64.zip -Force
+          # the single self-contained exe is also published on its own
+          Copy-Item build\nwc-connector.exe nwc-connector.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            nwc-connector.exe
+            nwc-connector-windows-x64.zip
+
+  # ------------------------------------------------------------------ Linux
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libusb-1.0-0-dev
+
+      - name: Build probe
+        run: |
+          cd src/probe
+          gcc -O2 -Wall -Wno-unused-function -o nwcusb_probe nwcusb_probe.c \
+              -I. -I/usr/include/libusb-1.0 -lusb-1.0
+          file nwcusb_probe
+
+      - name: Package Linux artifacts
+        run: |
+          mkdir -p pkg/nwc-connector
+          cp src/probe/nwcusb_probe pkg/nwc-connector/
+          cp linux/nwc-connector.sh pkg/nwc-connector/
+          chmod +x pkg/nwc-connector/nwc-connector.sh pkg/nwc-connector/nwcusb_probe
+          cp docs/USAGE.md pkg/nwc-connector/README.md 2>/dev/null || true
+          tar -C pkg -czf nwc-connector-linux-x86_64.tar.gz nwc-connector
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: nwc-connector-linux-x86_64.tar.gz
+
+  # ----------------------------------------------------------------- publish
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: List artifacts
+        run: find dist -type f
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/windows/nwc-connector.exe
+            dist/windows/nwc-connector-windows-x64.zip
+            dist/linux/nwc-connector-linux-x86_64.tar.gz
+          generate_release_notes: true
+          body: |
+            Ready-to-run Nintendo Wi-Fi USB Connector builds.
+
+            **Windows:** download `nwc-connector.exe`, run it (it self-elevates and
+            opens a console with live logging). One-time: bind the RT2570 dongle to
+            WinUSB/libusbK with `install-driver.cmd` (in the zip) or Zadig.
+            Auto-start at logon: `nwc-connector.exe --install-autostart`.
+
+            **Linux:** extract `nwc-connector-linux-x86_64.tar.gz` and run
+            `sudo ./nwc-connector.sh` (installs deps, sets up NAT/DNS, starts the probe).

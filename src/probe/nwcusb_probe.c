@@ -12,7 +12,9 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN   /* keep windows.h from pulling in winsock.h v1 (wintun.h needs winsock2.h) */
 #include <windows.h>
+#include <winsock2.h>         /* struct timeval, used by the TX-pacing RX pump in send_80211_frame */
 #endif
 #include "libusb.h"
 #ifndef _WIN32
@@ -24,8 +26,6 @@
 #include <net/if.h>
 #include <linux/if_tun.h>
 static int g_tap_fd = -1;            /* TAP fd for the DS<->internet data bridge (NWC_DATAPATH) */
-static uint8_t g_sta_mac[6] = {0};   /* associated DS station MAC, learned from RX data */
-static int g_sta_known = 0;
 static void tiny_sleep(void);
 static int mgmt_ie_offset(const uint8_t *frame, int frame_len);
 #endif
@@ -244,9 +244,7 @@ static bool contains_utf16le_ascii_nocase(const uint8_t *data, int len, const ch
 
 static bool contains_registration_hint(const uint8_t *data, int len)
 {
-    return contains_ascii_nocase(data, len, "PlayerName") ||
-           contains_utf16le_ascii_nocase(data, len, "PlayerName") ||
-           contains_ascii_nocase(data, len, "Nintendo") ||
+    return contains_ascii_nocase(data, len, "Nintendo") ||
            contains_utf16le_ascii_nocase(data, len, "Nintendo") ||
            contains_ascii_nocase(data, len, "NWCUSB") ||
            contains_utf16le_ascii_nocase(data, len, "NWCUSB");
@@ -260,6 +258,18 @@ static void sleep_ms(unsigned int ms)
     (void)ms;
     tiny_sleep();
 #endif
+}
+
+/* USB transfer timeout (ms). libusbK occasionally hangs a transfer for the FULL timeout under load,
+ * blocking the single-threaded main loop for that long (Linux usbfs never does this). The old 2000ms
+ * meant one hung register read/write stalled the loop ~2s -> beacon dark -> DS drops -> auth storm.
+ * Cap it (NWC_TX_TIMEOUT, default 250ms) so a hang costs a dropped frame, not the connection. */
+static unsigned nwc_usb_timeout(void)
+{
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("NWC_TX_TIMEOUT"); t = (e && *e) ? atoi(e) : 250;
+                 if (t < 50) t = 50; if (t > 2000) t = 2000; }
+    return (unsigned)t;
 }
 
 static int vendor_read(libusb_device_handle *handle, uint8_t request,
@@ -288,7 +298,7 @@ static int vendor_read(libusb_device_handle *handle, uint8_t request,
                request, index, length, label);
     int rc = libusb_control_transfer(handle, USB_VENDOR_REQUEST_IN, request,
                                      0, index, (unsigned char *)buffer,
-                                     length, 2000);
+                                     length, nwc_usb_timeout());
     if (rc < 0) {
         printf("[usb] ERROR %s: %s\n", label, libusb_error_name(rc));
         return rc;
@@ -330,7 +340,7 @@ static int vendor_write(libusb_device_handle *handle, uint8_t request,
                request, index, value, length, label);
     int rc = libusb_control_transfer(handle, USB_VENDOR_REQUEST_OUT, request,
                                      value, index, (unsigned char *)buffer,
-                                     length, 2000);
+                                     length, nwc_usb_timeout());
     if (rc < 0) {
         printf("[usb] ERROR %s: %s\n", label, libusb_error_name(rc));
         return rc;
@@ -514,6 +524,16 @@ static int init_bbp(libusb_device_handle *handle, const uint8_t *eeprom)
                 return rc;
         }
     }
+
+    /* BBP R17 = CCA / RX-sensitivity threshold. The reset default is very sensitive, so ambient
+     * WiFi keeps the RT2570's carrier-sense asserted (CCA jam) and the beacon/TX engine backs off
+     * until it stalls. rt2500usb tunes R17 dynamically against the false-CCA count; we don't, so set
+     * a higher (less twitchy) fixed threshold. The DS is a strong, close signal so reduced RX
+     * sensitivity is harmless. NWC_BBP_R17 overrides (e.g. 0x28..0x40); 0 keeps the reset default. */
+    { const char *e = getenv("NWC_BBP_R17");
+      long r17 = (e && *e) ? strtol(e, NULL, 0) : 0x38;
+      if (r17 > 0) { bbp_write(handle, 17, (uint8_t)r17);
+          printf("[bbp] R17 CCA/RX-sensitivity threshold = 0x%02x\n", (unsigned)(r17 & 0xff)); } }
 
     printf("[bbp] init complete\n");
     return 0;
@@ -991,6 +1011,76 @@ static size_t build_assoc_response(uint8_t *out, size_t out_cap, const uint8_t m
     return (size_t)(p - out);
 }
 
+/* forward ref: the async-RX libusb context (defined near ap_loop), so the TX pacing gap can pump
+ * RX completions instead of starving them while it waits. */
+static libusb_context *g_ctx;
+
+/* A boolean env flag is ON only if set to a non-empty value that isn't "0"/"false"/"no".
+ * (Plain presence-checks treated NWC_FOO="0" as ON, which silently enabled the self-test flood.) */
+static int env_on(const char *name) {
+    const char *v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0;
+}
+
+/* ---------------- Async TX pool (non-blocking bulk-OUT) ----------------------------------------
+ * The blocking libusb_bulk_transfer serialises the main loop during a DS data burst on libusbK,
+ * which stalls the beacon + RX servicing and makes the dongle "go dark" (proven by the NUC/libusb
+ * comparison: same idle CCA, but Windows' loop stretches under load). Submit bulk-OUT transfers
+ * asynchronously from a recycled pool so the loop NEVER blocks on TX -- exactly how the Linux
+ * kernel path behaves. Completions are driven by the main loop's libusb_handle_events (+ the RX-
+ * drain pump). NWC_SYNC_TX forces the old blocking path for A/B. */
+#ifndef NWC_BACKEND_KMDF
+#define TX_POOL_SLOTS 256
+struct nwc_tx_slot { struct libusb_transfer *xfer; uint8_t buf[20 + 1600 + 8]; volatile int busy; };
+static struct nwc_tx_slot g_txpool[TX_POOL_SLOTS];
+static int g_txpool_ready = 0;
+static unsigned long g_tx_dropped = 0;
+static void LIBUSB_CALL nwc_tx_cb(struct libusb_transfer *t) { ((struct nwc_tx_slot*)t->user_data)->busy = 0; }
+static int nwc_txpool_init(void) {
+    for (int i = 0; i < TX_POOL_SLOTS; i++) {
+        g_txpool[i].xfer = libusb_alloc_transfer(0);
+        if (!g_txpool[i].xfer) return -1;
+        g_txpool[i].busy = 0;
+    }
+    g_txpool_ready = 1; return 0;
+}
+/* Queue `len` bytes on BULK_OUT_EP without blocking. 0=submitted, <0=libusb error, 1=pool full. */
+static int nwc_tx_async(libusb_device_handle *h, const uint8_t *data, int len) {
+    int i; struct nwc_tx_slot *s = NULL;
+    /* Reap completed/timed-out transfers FIRST (non-blocking). On libusbK the
+     * submit latency climbs sharply once many URBs are outstanding in the driver
+     * queue: during the DS re-assoc storm the pool saturates (queued~129), the
+     * loop gets stuck IN libusb_submit_transfer (200-800ms each) so it never
+     * reaches the main loop's handle_events to drain them -> the server->DS GPCM
+     * challenge is never delivered -> DS times out -> 61010 + more storm. Draining
+     * here keeps both our slot pool and the driver queue free so submit stays ~1ms.
+     * RX callbacks only enqueue to g_rxq (same thread) so this is reentrancy-safe. */
+    unsigned long _t0 = GetTickCount();
+    if (g_ctx) { struct timeval z = {0,0}; libusb_handle_events_timeout_completed(g_ctx, &z, NULL); }
+    unsigned long _t1 = GetTickCount();
+    if (_t1 - _t0 > 80) printf("[stall] tx-reap %lums\n", _t1 - _t0);
+    for (i = 0; i < TX_POOL_SLOTS; i++) if (!g_txpool[i].busy) { s = &g_txpool[i]; break; }
+    if (!s) return 1;
+    if (len > (int)sizeof s->buf) len = (int)sizeof s->buf;
+    s->busy = 1; memcpy(s->buf, data, (size_t)len);
+    /* Async TX timeout capped to nwc_usb_timeout() (default 250ms), NOT 2000ms.
+     * On libusbK the driver holds a bounded number of outstanding bulk-OUT URBs;
+     * when the DS stops ACKing (link dropping mid-connection) a transfer hangs to
+     * its timeout, saturating that queue, so libusb_submit_transfer() itself blocks
+     * ~240ms waiting for a free slot -> each mgmt-response submit stalls -> 24 of
+     * them stack into a ~5.8s rxdrain stall -> beacon starved -> DS Data-Abort.
+     * A 250ms cap frees a hung slot 8x faster; a healthy bulk-OUT completes in ~1ms
+     * so this never clips a good transfer. Software retransmit covers the rest. */
+    libusb_fill_bulk_transfer(s->xfer, h, BULK_OUT_EP, s->buf, len, nwc_tx_cb, s,
+                              nwc_usb_timeout());
+    unsigned long _t2 = GetTickCount();
+    int rc = libusb_submit_transfer(s->xfer);
+    { unsigned long _t3 = GetTickCount(); if (_t3 - _t2 > 80) printf("[stall] tx-submit %lums\n", _t3 - _t2); }
+    if (rc != 0) { s->busy = 0; return rc; }
+    return 0;
+}
+#endif
+
 static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
                             size_t frame_len, bool request_timestamp,
                             bool request_ack, const char *label)
@@ -1012,6 +1102,10 @@ static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
          * blocking the ~10us SIFS hardware auto-ACK for the DS's next auth seq1, so the
          * DS never sees seq1 acknowledged and loops (fc=0x08b0) -> 51303. NWC_RETRY7
          * restores the old value for A/B testing. */
+        /* RETRY_LIMIT stays 0. Tried retry_limit=7 for DATA frames (normal 802.11 reliability):
+         * it hangs the RT2570's single TX engine -- the bulk-OUT completion is withheld through
+         * the retransmit/ACK-timeout cycles and libusb bulk_transfer returns LIBUSB_ERROR_TIMEOUT,
+         * so DATA TX fails outright. Software-level retransmit (below) is the only viable path. */
         if (getenv("NWC_RETRY7") && *getenv("NWC_RETRY7"))
             w0 |= 0x00000070u;
         w0 |= 0x00000200u; /* ACK required */
@@ -1082,27 +1176,95 @@ static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
      * OUT path is a proper autonomous-TX path (like the original) rather than a
      * software-kick-only path — the precondition for the hardware auto-ACK
      * (which has no software kick) to be able to transmit at all. */
-    int noguard = (getenv("NWC_NOGUARDIAN") && *getenv("NWC_NOGUARDIAN"));
+    int noguard = (env_on("NWC_NOGUARDIAN"));
     /* usbmon capture of the WORKING original XP driver: the guardian byte precedes ONLY the
      * beacon; data/mgmt frames (incl. the seq2 auth-response, frame 15447) are a bare bulk-OUT
      * with NO guardian. We had been prepending a guardian to every frame — a candidate for why
      * our unicast seq2 never radiates. Match the original: guardian beacons only.
      * NWC_GUARD_ALL restores the old "guardian every frame" behaviour for A/B testing. */
-    int guard_all = (getenv("NWC_GUARD_ALL") && *getenv("NWC_GUARD_ALL"));
-    int want_guardian = guard_all || (strstr(label, "beacon") != NULL);
+    int guard_all = (env_on("NWC_GUARD_ALL"));
+    /* Over-the-air capture (AR9271) proved the Windows/libusbK failure mode: a DATA frame handed to
+     * the dongle over USB is accepted (TX "succeeds") but NEVER keys the radio without the 1-byte
+     * guardian kick -- beacons (which get the kick) radiated fine while 559 data frames produced
+     * ZERO on-air frames. So the data path needs the guardian too; auth/mgmt stay guardian-less to
+     * keep the seq2 auth-response radiation fix intact. NWC_NOGUARD_DATA disables it for A/B. */
+    /* Default = guardian-beacons-only, exactly like the proven Linux path. NWC_GUARD_DATA adds it
+     * to data frames for A/B testing (an earlier "data needs the guardian" theory came from captures
+     * later found to be contaminated by a second dongle's rogue beacon on the same channel). */
+    int guard_data = (env_on("NWC_GUARD_DATA"));
+    int want_guardian = guard_all || (strstr(label, "beacon") != NULL)
+                        || (guard_data && strstr(label, "data") != NULL);
     int rc = 0;
-    if (!noguard && want_guardian) {
-        rc = libusb_bulk_transfer(handle, BULK_OUT_EP, &guardian, 1, &transferred, 2000);
-        if (rc != 0) {
-            printf("[tx] %s guardian failed: %s\n", label, libusb_error_name(rc));
-            return rc;
+
+    /* HYBRID TX: only LARGE frames (bulk DS<->internet data, >=256B transfer) go async, so a data
+     * burst never blocks the main loop. Everything SMALL -- beacons (need a steady ~100ms cadence;
+     * async made them jittery -> 51303 "can't see it"), and time-critical control frames (DNS
+     * answers, ARP, auth/mgmt) -- stays SYNCHRONOUS so it's delivered promptly. A DNS reply stuck
+     * behind the async bulk backlog during the QR2 burst times out -> Wiimmfi 64030 "DNS failure".
+     * NWC_SYNC_TX forces everything sync; NWC_ASYNC_MIN overrides the size threshold. */
+    const char *am = getenv("NWC_ASYNC_MIN"); int async_min = (am && *am) ? atoi(am) : 256;
+    /* Force DATA frames (internet forwarding + WinDivert gamespy injections) async REGARDLESS of size.
+     * PROVEN: a libusbK SYNC bulk transfer blocks the main loop ~10ms each (Linux usbfs = microseconds),
+     * so the small (<256B) gamespy result/ACK injections stall the loop 80ms+ during the login burst ->
+     * beacon starves + the cleared-on-read CCA counter inflates into a fake spike -> dropped GPCM. Auth
+     * frames stay sync (their SIFS auto-ACK timing needs it). NWC_DATA_SYNC forces the old behaviour. */
+    /* Async also for probe-response + assoc-response: during a DS re-scan/auth STORM the RX drain
+     * processes many frames per loop pass and EACH triggered a SYNC response -> dozens of blocking
+     * USB TX in one iteration = multi-second loop stall -> beacon starves -> more storm. Only the
+     * auth seq2/seq4 (SIFS auto-ACK timing) must stay sync. NWC_DATA_SYNC forces the old behaviour. */
+    int force_async = (strstr(label, "data") != NULL || strstr(label, "probe") != NULL
+                       || strstr(label, "assoc") != NULL) && !env_on("NWC_DATA_SYNC");
+    if (!env_on("NWC_SYNC_TX") && strstr(label, "beacon") == NULL && (force_async || transfer_len >= async_min)) {
+        if (!g_txpool_ready && nwc_txpool_init() != 0) {
+            printf("[tx] async pool alloc failed\n"); return LIBUSB_ERROR_NO_MEM; }
+        /* CRITICAL RELIABILITY (Linux-parity fix): server->DS DATA frames must NEVER be
+         * silently dropped. On a full async pool the old code did g_tx_dropped++/return 0,
+         * reporting success while the frame vanished -> a lost GPCM segment -> the DS never
+         * ACKs -> server retransmit STORM -> that very flood keeps the pool full -> more
+         * drops. Linux's kernel NAT never drops, so its GPCM completes and no storm forms.
+         * Here: if the pool is full for a "data" frame, fall through to the reliable SYNC
+         * path below instead of dropping. Non-data frames (probe/assoc responses) may still
+         * drop -- a later one re-arms. NWC_NO_DATASYNC_FALLBACK disables for A/B. */
+        bool is_data = (strstr(label, "data") != NULL) && !env_on("NWC_NO_DATASYNC_FALLBACK");
+        bool pool_full = false;
+        if (!noguard && want_guardian) {
+            static const uint8_t gzero = 0;
+            rc = nwc_tx_async(handle, &gzero, 1);
+            if (rc == 1) pool_full = true;
+            else if (rc < 0) { printf("[tx] %s guardian submit: %s\n", label, libusb_error_name(rc)); return rc; }
+        }
+        if (!pool_full) {
+            rc = nwc_tx_async(handle, packet, transfer_len);
+            if (rc == 1) pool_full = true;
+            else if (rc < 0) { printf("[tx] %s frame submit: %s\n", label, libusb_error_name(rc)); return rc; }
+            else {
+                if ((strcmp(label, "beacon") != 0 && strcmp(label, "beacon-sw") != 0) || VERBOSE_USB_REG)
+                    printf("[tx] %s queued: %d bytes (async)\n", label, transfer_len);
+                return 0;
+            }
+        }
+        if (pool_full) {
+            if (!is_data) { g_tx_dropped++; return 0; }   /* non-data: drop, a later frame re-arms */
+            /* data frame + full pool -> fall through to reliable SYNC send below */
+            static unsigned long g_data_syncfb = 0;
+            if ((++g_data_syncfb & 0x3f) == 1)
+                printf("[tx] data pool-full -> reliable sync fallback (count=%lu)\n", g_data_syncfb);
         }
     }
-    rc = libusb_bulk_transfer(handle, BULK_OUT_EP, packet, transfer_len, &transferred, 2000);
-    if (rc != 0) {
-        printf("[tx] %s frame failed (noguard=%d): %s\n", label, noguard, libusb_error_name(rc));
-        return rc;
+
+    /* Legacy blocking path (NWC_SYNC_TX) + the beacon/auth sync frames. THE last loop-stall fix:
+     * the timeout was 2000ms, so an occasional libusbK hang under load blocked the whole main loop
+     * for ~2s -> beacon dark -> DS drops -> auth storm. Cap it (NWC_TX_TIMEOUT, default 250ms): a hang
+     * now costs one dropped beacon, the loop continues, the next beacon retries. Linux usbfs never
+     * hangs so this is Windows-specific. */
+    static int txto = -1;
+    if (txto < 0) { const char *e=getenv("NWC_TX_TIMEOUT"); txto=(e&&*e)?atoi(e):250; if(txto<50)txto=50; if(txto>2000)txto=2000; }
+    if (!noguard && want_guardian) {
+        rc = libusb_bulk_transfer(handle, BULK_OUT_EP, &guardian, 1, &transferred, (unsigned)txto);
+        if (rc != 0) { printf("[tx] %s guardian failed: %s\n", label, libusb_error_name(rc)); return rc; }
     }
+    rc = libusb_bulk_transfer(handle, BULK_OUT_EP, packet, transfer_len, &transferred, (unsigned)txto);
+    if (rc != 0) { printf("[tx] %s frame failed (noguard=%d): %s\n", label, noguard, libusb_error_name(rc)); return rc; }
     if (strcmp(label, "beacon") != 0 || VERBOSE_USB_REG)
         printf("[tx] %s sent: %d bytes (noguard=%d)\n", label, transferred, noguard);
     return 0;
@@ -1134,7 +1296,7 @@ static int raw_bulk_out(libusb_device_handle *handle, const uint8_t *buf, int le
     return 0;
 #else
     int tr = 0;
-    int rc = libusb_bulk_transfer(handle, BULK_OUT_EP, (unsigned char *)buf, len, &tr, 2000);
+    int rc = libusb_bulk_transfer(handle, BULK_OUT_EP, (unsigned char *)buf, len, &tr, nwc_usb_timeout());
     if (rc != 0) { printf("[hwbcn] %s bulk failed: %s\n", label, libusb_error_name(rc)); return rc; }
     return 0;
 #endif
@@ -1187,9 +1349,35 @@ static int hw_load_beacon(libusb_device_handle *handle, const uint8_t mac[6], co
     return 0;
 }
 
-/* ---- DS<->internet data bridge (NWC_DATAPATH): TAP + software WEP + 802.11<->Ethernet ---- */
-#ifndef _WIN32
+/* ---- DS<->internet data bridge (NWC_DATAPATH): software WEP + 802.11<->Ethernet ----
+ * The SNAP header, WEP-encrypt, and the Ethernet->802.11 TX helper are cross-platform. The Linux
+ * TAP path (kernel does ARP/DHCP/NAT) and the Windows Wintun path (probe does ARP/DHCP, Windows
+ * NAT) share them. */
 static const uint8_t SNAP_HDR[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+static uint8_t g_sta_mac[6] = {0};   /* associated DS station MAC, learned from RX data (both OSes) */
+static int g_sta_known = 0;
+static unsigned long g_last_ds_rx = 0;  /* GetTickCount() of the last frame heard from the DS */
+volatile unsigned long g_loop_max = 0;  /* worst single main-loop iteration (ms) since last stacsr */
+static unsigned long g_last_auth_rx = 0; /* GetTickCount() of the last AUTH frame from the DS.
+                                          * Used to tell DISCOVERY (DS scanning, wants probe-
+                                          * responses) apart from the AUTH window (must stay off
+                                          * the air so the DS's seq1 gets its SIFS auto-ACK). */
+/* net->DS TCP re-send cache. THE gamespy fix: pktmon proved the server retransmits each control/data
+ * segment many times (SYN-ACK ~36x, the \lc\ login response ~42x), but Windows' New-NetNat only
+ * delivers ~2 of them onto Wintun and then stops -- so with retry_limit=0 (lossy OTA) the DS never
+ * receives the segment, never ACKs, and gpcm login stalls (-> 61010/61070). Linux's kernel NAT
+ * delivers every retransmit. We replicate that: cache the latest server->DS SYN-ACK *or PSH data*
+ * segment and re-send it to the DS every ~150ms until the DS replies to that flow (or a bound). The
+ * buffer holds a full small gamespy segment (challenge / \lc\2\ login result are ~100-200 bytes). */
+static struct {
+    uint8_t  eth[700]; int len;
+    uint32_t srv_ip; uint16_t srv_port, ds_port;
+    uint32_t end_seq;                 /* server seq just past this segment; clear when DS ACKs >= it */
+    unsigned long last_send; int resends; int active;
+} g_synack = {0};
+static void rawret_note_flow(uint32_t srv_ip, uint16_t srv_port, uint16_t ds_port); /* raw-return fwd */
+static int  g_wd_active = 0;                 /* 1 = full userspace NAT via WinDivert (WinNAT bypassed) */
+static void wd_nat_outbound(const uint8_t *ip, int len);  /* SNAT DS->server + WinDivertSend (fwd) */
 
 /* WEP-encrypt a plaintext body -> [IV(3)][keyid(1)][RC4(plain||ICV)]. Returns out length. */
 static int wep_encrypt_body(const uint8_t *plain, int plain_len, const uint8_t key[13],
@@ -1216,6 +1404,51 @@ static int wep_encrypt_body(const uint8_t *plain, int plain_len, const uint8_t k
     return 4 + plain_len + 4;
 }
 
+/* network-order (big-endian) helpers for IP/UDP/ARP/DHCP packet building */
+static uint16_t rdbe16(const uint8_t *p){ return (uint16_t)(((uint16_t)p[0]<<8)|p[1]); }
+static uint32_t rdbe32(const uint8_t *p){ return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static void wrbe16(uint8_t *p, uint16_t v){ p[0]=(uint8_t)(v>>8); p[1]=(uint8_t)v; }
+static void wrbe32(uint8_t *p, uint32_t v){ p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v; }
+static uint16_t inet_cksum(const uint8_t *d, int n){ uint32_t s=0; int i; for(i=0;i+1<n;i+=2) s+=rdbe16(d+i); if(n&1) s+=(uint32_t)d[n-1]<<8; while(s>>16) s=(s&0xffff)+(s>>16); return (uint16_t)~s; }
+
+static int send_80211_frame(libusb_device_handle *handle, const uint8_t *frame,
+                            size_t frame_len, bool request_timestamp,
+                            bool request_ack, const char *label);
+
+/* Build an 802.11 FromDS data frame carrying an Ethernet payload (SNAP-encapsulated), WEP-encrypt
+ * if privacy, and TX to the DS. da=dest(DS), sa=src(gateway). Shared by TAP + Wintun paths. */
+static void send_eth_to_ds(libusb_device_handle *handle, const uint8_t mac[6], const char *ssid,
+                           bool privacy, const uint8_t da[6], const uint8_t sa[6],
+                           uint16_t ethertype, const uint8_t *payload, int paylen)
+{
+    if (paylen < 0 || paylen > 1600) return;
+    uint8_t plainbody[2320];
+    memcpy(plainbody, SNAP_HDR, 6);
+    plainbody[6] = (uint8_t)(ethertype >> 8); plainbody[7] = (uint8_t)(ethertype & 0xff);
+    memcpy(plainbody + 8, payload, (size_t)paylen);
+    int bp_len = 8 + paylen;
+    uint8_t out[2400];
+    uint16_t fc = 0x0208;                          /* data, FromDS=1 */
+    put16(out + 0, fc); put16(out + 2, 0);
+    memcpy(out + 4, da, 6); memcpy(out + 10, mac, 6); memcpy(out + 16, sa, 6);
+    put16(out + 22, 0);
+    int body_len;
+    /* DIAGNOSTIC: NWC_PLAINTEXT_DATA forces plaintext data frames (no WEP, no Protected bit) to
+     * test whether the Protected/WEP path is what stops data frames radiating on Windows. */
+    int plaintext = (env_on("NWC_PLAINTEXT_DATA"));
+    if (privacy && !plaintext) {
+        uint8_t wk[13]; derive_original_wep_key(ssid + 12, wk);
+        body_len = wep_encrypt_body(plainbody, bp_len, wk, out + 24, (int)sizeof out - 24);
+        if (body_len < 0) return;
+        put16(out + 0, (uint16_t)(fc | 0x4000));   /* Protected */
+    } else {
+        if (24 + bp_len > (int)sizeof out) return;
+        memcpy(out + 24, plainbody, (size_t)bp_len); body_len = bp_len;
+    }
+    send_80211_frame(handle, out, (size_t)(24 + body_len), false, true, "data");
+}
+
+#ifndef _WIN32
 static int tap_open(const char *name)
 {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -1326,6 +1559,921 @@ static void tap_poll_to_ds(libusb_device_handle *handle, const uint8_t mac[6],
 }
 #endif /* !_WIN32 */
 
+#ifdef _WIN32
+/* ---- Windows Wintun data path (L3) ----
+ * Wintun is IP-only, so the probe answers the DS's ARP + DHCP itself and injects the DS's IP
+ * packets into a Wintun adapter; Windows New-NetNat + IP forwarding carry them to the internet.
+ * DNS is also answered in-probe (Windows' NAT/ICS DNS proxy otherwise replies from the gateway IP,
+ * which the DS rejects): we forward the query to the real Wiimmfi DNS and reply with its source. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include "wintun.h"
+#include "windivert.h"
+static SOCKET g_dns_sock = INVALID_SOCKET;
+static uint32_t g_wiimmfi_ip = 0xBC22B1D9u;   /* 188.34.177.217 (nas.wiimmfi.de); refreshed at startup */
+static WINTUN_CREATE_ADAPTER_FUNC         *pWtCreate;
+static WINTUN_CLOSE_ADAPTER_FUNC          *pWtClose;
+static WINTUN_START_SESSION_FUNC          *pWtStart;
+static WINTUN_END_SESSION_FUNC            *pWtEnd;
+static WINTUN_ALLOCATE_SEND_PACKET_FUNC   *pWtAlloc;
+static WINTUN_SEND_PACKET_FUNC            *pWtSend;
+static WINTUN_RECEIVE_PACKET_FUNC         *pWtRecv;
+static WINTUN_RELEASE_RECEIVE_PACKET_FUNC *pWtRelease;
+static WINTUN_OPEN_ADAPTER_FUNC           *pWtOpen;
+static WINTUN_ADAPTER_HANDLE  g_wt_adapter;
+static WINTUN_SESSION_HANDLE  g_wt_session;
+static int g_win_bridge;
+
+#define WNET_GW   0xC0A82C01u   /* 192.168.44.1  (gateway = us)          */
+#define WNET_DS   0xC0A82C14u   /* 192.168.44.20 (assigned to the DS)    */
+#define WNET_MASK 0xFFFFFF00u   /* 255.255.255.0                         */
+#define WNET_DNS  0xA4842C6Au   /* 164.132.44.106 (public Wiimmfi DNS)   */
+static const uint8_t GW_MAC[6] = { 0x02, 0x4e, 0x57, 0x43, 0x44, 0x01 }; /* locally-administered */
+static void win_send_eth(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy,
+                         const uint8_t *eth, int ethlen);   /* fwd decl (used by win_handle_dns) */
+
+static int win_datapath_init(void)
+{
+    HMODULE h = LoadLibraryExW(L"wintun.dll", NULL,
+                   LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) { printf("[wintun] cannot load wintun.dll (place it next to the exe): gle=%lu\n", GetLastError()); return -1; }
+    pWtCreate =(WINTUN_CREATE_ADAPTER_FUNC*)        GetProcAddress(h,"WintunCreateAdapter");
+    pWtClose  =(WINTUN_CLOSE_ADAPTER_FUNC*)         GetProcAddress(h,"WintunCloseAdapter");
+    pWtStart  =(WINTUN_START_SESSION_FUNC*)         GetProcAddress(h,"WintunStartSession");
+    pWtEnd    =(WINTUN_END_SESSION_FUNC*)           GetProcAddress(h,"WintunEndSession");
+    pWtAlloc  =(WINTUN_ALLOCATE_SEND_PACKET_FUNC*)  GetProcAddress(h,"WintunAllocateSendPacket");
+    pWtSend   =(WINTUN_SEND_PACKET_FUNC*)           GetProcAddress(h,"WintunSendPacket");
+    pWtRecv   =(WINTUN_RECEIVE_PACKET_FUNC*)        GetProcAddress(h,"WintunReceivePacket");
+    pWtRelease=(WINTUN_RELEASE_RECEIVE_PACKET_FUNC*)GetProcAddress(h,"WintunReleaseReceivePacket");
+    pWtOpen   =(WINTUN_OPEN_ADAPTER_FUNC*)          GetProcAddress(h,"WintunOpenAdapter");
+    if (!pWtCreate||!pWtStart||!pWtAlloc||!pWtSend||!pWtRecv||!pWtRelease){ printf("[wintun] missing exports\n"); return -1; }
+    GUID g = { 0x4e574344, 0x0001, 0x4001, { 0x80,0x00,0x00,0x11,0x22,0x33,0x44,0x55 } };
+    /* A killed predecessor's adapter tears down asynchronously (and Wintun may
+     * uninstall/reinstall its driver on last-adapter-removal), so create can
+     * transiently fail with ERROR_NOT_FOUND(1168)/ERROR_DEVICE_REINITIALIZATION_NEEDED.
+     * Retry, trying open-existing first each round so we adopt a stale adapter if present. */
+    for (int attempt = 0; attempt < 12 && !g_wt_adapter; attempt++) {
+        if (pWtOpen) {
+            g_wt_adapter = pWtOpen(L"NWC-DS");
+            if (g_wt_adapter) { printf("[wintun] reusing existing 'NWC-DS' adapter\n"); break; }
+        }
+        g_wt_adapter = pWtCreate(L"NWC-DS", L"Wintun", &g);
+        if (g_wt_adapter) break;
+        DWORD gle = GetLastError();
+        printf("[wintun] create attempt %d failed gle=%lu; retrying...\n", attempt+1, gle);
+        Sleep(600);
+    }
+    if (!g_wt_adapter){ printf("[wintun] Create/Open adapter failed after retries: gle=%lu\n", GetLastError()); return -1; }
+    g_wt_session = pWtStart(g_wt_adapter, 0x400000);
+    if (!g_wt_session){ printf("[wintun] StartSession failed: gle=%lu\n", GetLastError()); pWtClose(g_wt_adapter); return -1; }
+    { WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+      g_dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (g_dns_sock != INVALID_SOCKET) { DWORD tmo = 400; /* ms */
+          setsockopt(g_dns_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo); }
+      /* Wiimmfi's own DNS (164.132.44.106) is dead; resolve the live server IP via the
+       * host resolver so we can answer the DS's *.nintendowifi.net queries authoritatively.
+       * Override with NWC_WIIMMFI_IP=a.b.c.d. */
+      const char *ovr = getenv("NWC_WIIMMFI_IP");
+      struct addrinfo hints, *res = NULL; memset(&hints,0,sizeof hints); hints.ai_family = AF_INET;
+      if (ovr && ovr[0]) { g_wiimmfi_ip = ntohl(inet_addr(ovr)); }
+      else if (getaddrinfo("nas.wiimmfi.de", NULL, &hints, &res) == 0 && res) {
+          g_wiimmfi_ip = ntohl(((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr);
+      }
+      if (res) freeaddrinfo(res);
+      printf("[wintun] Wiimmfi server IP for DS DNS answers = %u.%u.%u.%u\n",
+             (g_wiimmfi_ip>>24)&0xff,(g_wiimmfi_ip>>16)&0xff,(g_wiimmfi_ip>>8)&0xff,g_wiimmfi_ip&0xff); }
+    g_win_bridge = 1;
+    printf("[wintun] adapter 'NWC-DS' created; now run nwc-datapath-setup.ps1 for IP + NAT\n");
+    return 0;
+}
+
+/* UDP checksum over the pseudo-header + UDP segment. The DS's DNS resolver (unlike its DHCP
+ * client) validates this and silently drops a checksum=0 datagram, so it must be correct. */
+static uint16_t udp_cksum(uint32_t src, uint32_t dst, const uint8_t *udp, int udplen)
+{
+    uint32_t sum = 0;
+    sum += (src >> 16) & 0xffff; sum += src & 0xffff;
+    sum += (dst >> 16) & 0xffff; sum += dst & 0xffff;
+    sum += 17; sum += (uint32_t)udplen;
+    int i; for (i = 0; i + 1 < udplen; i += 2) sum += (uint32_t)((udp[i] << 8) | udp[i+1]);
+    if (udplen & 1) sum += (uint32_t)(udp[udplen-1] << 8);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    uint16_t c = (uint16_t)~sum;
+    return c ? c : 0xffff;
+}
+
+/* Map a DS DNS query (X.nintendowifi.net) to the CORRECT Wiimmfi server IP. Wiimmfi splits its
+ * services across hosts -- NAS/conntest/web on one IP (188.34.177.217), the gamespy stack
+ * (gpcm/gpsp/master/natneg on 29900/29901/28910) on another (95.217.77.151) -- so a single-IP
+ * answer breaks online matchmaking (game logs into conntest/NAS fine, then its gpcm connection
+ * hits the NAS host where 29900 is closed -> 52103). We resolve the equivalent X.wiimmfi.de via
+ * the host resolver (cached) to get whichever host Wiimmfi actually serves that name from. */
+static struct { char name[80]; uint32_t ip; } g_dnsc[48];
+static int g_dnsc_n = 0;
+
+/* ===== ASYNC DNS (Linux-parity fix for the Windows loop stall) ==========================
+ * The Windows path answers the DS's DNS queries in-process (Wiimmfi's own DNS 164.132.44.106
+ * is dead). The OLD wiimmfi_ip_for() resolved each new name with a BLOCKING getaddrinfo() on
+ * the RX/main-loop thread -> ap_loop stalled up to ~5s per new name (the DS issues ~8 lookups
+ * during a gamespy login) -> wd_drain couldn't run -> the server->DS ring backed up -> the
+ * late 45-byte GPCM segment was stranded -> DS never ACKed -> null-deref Data-Abort crash.
+ * Linux never does this: tap_rx_dsdata just write()s the query to the TAP and the kernel/
+ * dnsmasq resolves it asynchronously. We mirror that: a dedicated resolver thread does all
+ * getaddrinfo work OFF the packet thread, plus a SYNCHRONOUS startup pre-warm so the cache is
+ * populated before the DS ever connects. The packet thread (wiimmfi_ip_for) ONLY reads the
+ * cache and NEVER blocks. ===============================================================*/
+static CRITICAL_SECTION g_dns_cs;
+static int g_dns_cs_init = 0;
+static char g_dns_q[64][80]; static int g_dns_qh = 0, g_dns_qt = 0;
+
+static void dns_store(const char *host, uint32_t ip)
+{
+    if (!g_dns_cs_init) return;
+    EnterCriticalSection(&g_dns_cs);
+    int i; for (i = 0; i < g_dnsc_n; i++) if (_stricmp(g_dnsc[i].name, host)==0) { g_dnsc[i].ip = ip; break; }
+    if (i == g_dnsc_n && g_dnsc_n < (int)(sizeof(g_dnsc)/sizeof(g_dnsc[0]))) {
+        strncpy(g_dnsc[g_dnsc_n].name, host, sizeof(g_dnsc[0].name)-1);
+        g_dnsc[g_dnsc_n].name[sizeof(g_dnsc[0].name)-1]=0; g_dnsc[g_dnsc_n].ip = ip; g_dnsc_n++;
+    }
+    LeaveCriticalSection(&g_dns_cs);
+}
+
+/* BLOCKING resolve -- call ONLY off the packet thread (startup prewarm or resolver thread). */
+static uint32_t dns_resolve_now(const char *host)
+{
+    char target[96];                                      /* rewrite *.nintendowifi.net -> *.wiimmfi.de */
+    const char *suf = ".nintendowifi.net"; size_t hl = strlen(host), sl = strlen(suf);
+    if (hl > sl && _stricmp(host + hl - sl, suf)==0) {
+        memcpy(target, host, hl - sl); strcpy(target + (hl - sl), ".wiimmfi.de");
+    } else { strncpy(target, host, sizeof(target)-1); target[sizeof(target)-1]=0; }
+    uint32_t ip = g_wiimmfi_ip;                           /* fallback if resolution fails */
+    struct addrinfo hints, *res = NULL; memset(&hints,0,sizeof hints); hints.ai_family = AF_INET;
+    if (getaddrinfo(target, NULL, &hints, &res)==0 && res)
+        ip = ntohl(((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr);
+    if (res) freeaddrinfo(res);
+    dns_store(host, ip);
+    printf("[dns-resolve] %s -> %s -> %u.%u.%u.%u\n", host, target,
+           (ip>>24)&0xff,(ip>>16)&0xff,(ip>>8)&0xff,ip&0xff);
+    return ip;
+}
+
+static DWORD WINAPI dns_resolver_thread(LPVOID a)
+{
+    (void)a;
+    for (;;) {
+        char host[80]; host[0] = 0;
+        EnterCriticalSection(&g_dns_cs);
+        if (g_dns_qt != g_dns_qh) { strncpy(host, g_dns_q[g_dns_qt], 79); host[79]=0; g_dns_qt=(g_dns_qt+1)%64; }
+        LeaveCriticalSection(&g_dns_cs);
+        if (!host[0]) { Sleep(15); continue; }
+        dns_resolve_now(host);
+    }
+    return 0;
+}
+
+static void dns_enqueue(const char *host)               /* non-blocking: hand a miss to the resolver thread */
+{
+    if (!g_dns_cs_init) return;
+    EnterCriticalSection(&g_dns_cs);
+    int q = 0; for (int i = g_dns_qt; i != g_dns_qh; i=(i+1)%64) if (_stricmp(g_dns_q[i], host)==0) { q=1; break; }
+    if (!q && ((g_dns_qh+1)%64) != g_dns_qt) { strncpy(g_dns_q[g_dns_qh], host, 79); g_dns_q[g_dns_qh][79]=0; g_dns_qh=(g_dns_qh+1)%64; }
+    LeaveCriticalSection(&g_dns_cs);
+}
+
+/* Startup: init the lock, launch the resolver thread, and SYNCHRONOUSLY pre-warm the cache
+ * with every name a DS gamespy session queries (off the hot path -- the DS isn't connected
+ * yet). After this returns the packet thread finds every login name already cached. */
+static void dns_init_prewarm(void)
+{
+    if (!g_dns_cs_init) { InitializeCriticalSection(&g_dns_cs); g_dns_cs_init = 1; }
+    CreateThread(NULL, 0, dns_resolver_thread, NULL, 0, NULL);
+    /* Wiimmfi PATCHES the game's DNS to query *.wiimmfi.de DIRECTLY (observed live: the DS asks
+     * for conntest.wiimmfi.de / gpcm.gs.wiimmfi.de, NOT *.nintendowifi.net). So pre-warm BOTH
+     * forms -- the .wiimmfi.de keys are the ones that actually get hit. A miss on a gamespy name
+     * used to fall back to the NAS IP (29900 closed there) -> 61020/52203/crash. */
+    static const char *pre[] = {
+        /* the forms the DS actually queries (Wiimmfi-patched) */
+        "nas.wiimmfi.de","naswii.wiimmfi.de","conntest.wiimmfi.de",
+        "gpcm.gs.wiimmfi.de","gpsp.gs.wiimmfi.de","sake.gs.wiimmfi.de",
+        "master.gs.wiimmfi.de","natneg1.gs.wiimmfi.de","natneg2.gs.wiimmfi.de","natneg3.gs.wiimmfi.de",
+        "gamestats.gs.wiimmfi.de","gamestats2.gs.wiimmfi.de",
+        "mariokartds.master.gs.wiimmfi.de","mariokartds.available.gs.wiimmfi.de",
+        "metroidprimehunters.master.gs.wiimmfi.de","metroidprimehunters.available.gs.wiimmfi.de",
+        /* legacy .nintendowifi.net forms (unpatched games), kept for safety */
+        "nas.nintendowifi.net","conntest.nintendowifi.net",
+        "gpcm.gs.nintendowifi.net","gpsp.gs.nintendowifi.net","master.gs.nintendowifi.net",
+        "mariokartds.master.gs.nintendowifi.net","mariokartds.available.gs.nintendowifi.net"
+    };
+    printf("[dns] pre-warming %d Wiimmfi names (off the packet thread)...\n",
+           (int)(sizeof pre/sizeof pre[0]));
+    for (unsigned i = 0; i < sizeof pre/sizeof pre[0]; i++) dns_resolve_now(pre[i]);
+    printf("[dns] pre-warm complete (%d cached).\n", g_dnsc_n);
+}
+
+/* Packet-thread lookup: CACHE-ONLY, never blocks. Miss -> queue for async resolve + return
+ * the fallback for this one answer (the next query for the name hits the cache). */
+static uint32_t wiimmfi_ip_for(const char *qname)
+{
+    char host[80]; size_t n = 0;
+    for (const char *p = qname; *p && n < sizeof(host)-1; p++) host[n++] = *p;
+    if (n && host[n-1]=='.') n--;                         /* strip trailing dot from parser */
+    host[n] = 0;
+    uint32_t ip = 0; int hit = 0;
+    if (g_dns_cs_init) EnterCriticalSection(&g_dns_cs);
+    for (int i = 0; i < g_dnsc_n; i++) if (_stricmp(g_dnsc[i].name, host)==0) { ip = g_dnsc[i].ip; hit = 1; break; }
+    if (g_dns_cs_init) LeaveCriticalSection(&g_dns_cs);
+    if (hit) return ip;
+    dns_enqueue(host);                                    /* resolve in the background, no stall */
+    /* Gamespy-aware fallback: *.gs.* names live on the gamespy host (95.217.77.151), NOT the NAS
+     * host -- returning the NAS IP for a gpcm/gpsp/master miss sends the DS to a closed 29900
+     * (61020/52203/crash). Use the gamespy IP for gs names; the general fallback otherwise. */
+    uint32_t fb = (strstr(host, ".gs.") != NULL) ? 0x5FD94D97u /*95.217.77.151*/ : g_wiimmfi_ip;
+    printf("[dns-miss] %s -> async queued; fallback %u.%u.%u.%u this answer\n", host,
+           (fb>>24)&0xff,(fb>>16)&0xff,(fb>>8)&0xff,fb&0xff);
+    return fb;
+}
+
+/* Answer the DS's DNS query authoritatively with Wiimmfi's live server IP. Wiimmfi's own DNS
+ * (164.132.44.106) is dead, so we synthesise the A record here, resolving each name to the correct
+ * Wiimmfi host (see wiimmfi_ip_for). We reply from the exact server
+ * IP the DS queried (src preserved) so the DS accepts it (Windows' ICS proxy would answer from
+ * the gateway IP, which the DS rejects). */
+static void win_handle_dns(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy,
+                           const uint8_t *ip, int iplen, const uint8_t ds_mac[6])
+{
+    int ihl = (ip[0]&0x0f)*4;
+    const uint8_t *udp = ip + ihl;
+    int udplen = rdbe16(udp+4);
+    if (udplen < 20 || ihl + udplen > iplen) { printf("[dns] ERR: bad udplen %d\n", udplen); return; }
+    const uint8_t *q = udp + 8; int qlen = udplen - 8;
+    uint16_t ds_port = rdbe16(udp+0);
+    uint32_t server = rdbe32(ip+16);                      /* the DNS server the DS queried (preserve as reply src) */
+    if (qlen < 12 || rdbe16(q+4) < 1) { printf("[dns] ERR: no question\n"); return; }
+    /* walk the QNAME (labels terminated by a zero length byte), then qtype(2)+qclass(2) */
+    int p = 12; char qname[256]; int qn = 0;
+    while (p < qlen && q[p] != 0) { int l = q[p++]; if (l > 63 || p + l > qlen) { printf("[dns] ERR: bad qname\n"); return; }
+        for (int i = 0; i < l && qn < 254; i++) qname[qn++] = (char)q[p+i]; if (qn < 254) qname[qn++]='.'; p += l; }
+    if (p >= qlen) { printf("[dns] ERR: qname overrun\n"); return; }
+    qname[qn] = 0; int qend = p + 1;                       /* past the root label */
+    if (qend + 4 > qlen) { printf("[dns] ERR: no qtype\n"); return; }
+    uint16_t qtype = rdbe16(q + qend); qend += 4;
+    uint8_t ans[512]; if (qend > (int)sizeof(ans) - 16) { printf("[dns] ERR: query too long\n"); return; }
+    memcpy(ans, q, (size_t)qend);                         /* header + single question */
+    ans[2] = 0x85; ans[3] = 0x80;                         /* QR=1 AA=1 RD=1 / RA=1 rcode=0 */
+    wrbe16(ans+6, (qtype==1)?1:0);                        /* ANCOUNT: 1 for A, else 0 */
+    wrbe16(ans+8, 0); wrbe16(ans+10, 0);                  /* NSCOUNT/ARCOUNT: drop any EDNS OPT */
+    uint32_t ans_ip = wiimmfi_ip_for(qname);              /* correct Wiimmfi host for THIS name */
+    int anslen = qend;
+    if (qtype == 1) {                                     /* A record -> Wiimmfi IP */
+        ans[anslen++]=0xC0; ans[anslen++]=0x0C;           /* name ptr -> question */
+        wrbe16(ans+anslen,1); anslen+=2; wrbe16(ans+anslen,1); anslen+=2;   /* TYPE=A CLASS=IN */
+        wrbe32(ans+anslen,60); anslen+=4;                 /* TTL=60 */
+        wrbe16(ans+anslen,4); anslen+=2;                  /* RDLENGTH=4 */
+        wrbe32(ans+anslen, ans_ip); anslen+=4;
+    }
+    uint8_t pkt[600]; int totlen = 20 + 8 + anslen;
+    memset(pkt,0,20); pkt[0]=0x45; wrbe16(pkt+2,(uint16_t)totlen); pkt[8]=64; pkt[9]=17;
+    wrbe32(pkt+12, server); wrbe32(pkt+16, WNET_DS);      /* src = queried DNS server (DS accepts it) */
+    wrbe16(pkt+10, inet_cksum(pkt,20));
+    wrbe16(pkt+20, 53); wrbe16(pkt+22, ds_port);
+    wrbe16(pkt+24, (uint16_t)(8+anslen)); wrbe16(pkt+26, 0);
+    memcpy(pkt+28, ans, (size_t)anslen);
+    wrbe16(pkt+26, udp_cksum(server, WNET_DS, pkt+20, 8+anslen));   /* DS validates this on DNS */
+    uint8_t eth[600]; memcpy(eth,ds_mac,6); memcpy(eth+6,GW_MAC,6); wrbe16(eth+12,0x0800);
+    memcpy(eth+14, pkt, (size_t)totlen);
+    static int dns_dumped = 0;
+    if (!dns_dumped) { dns_dumped = 1;
+        printf("[dns-hex] query %d bytes / reply IP+UDP+DNS %d bytes:\n  QUERY:", qlen, totlen);
+        for (int i=0;i<qlen && i<80;i++) printf(" %02x", q[i]);
+        printf("\n  REPLY:");
+        for (int i=0;i<totlen && i<120;i++) printf(" %02x", pkt[i]);
+        printf("\n"); }
+    /* DNS answers are the control plane (the DS connects nowhere until it resolves the server) and
+     * are small, so send a few copies -- a single lost gamespy reply otherwise leaves the DS
+     * re-querying forever and reporting "no servers" (20998). retry_limit=0 = no hardware retry. */
+    { static int dns_dup = -1;
+      if (dns_dup < 0) { const char *e = getenv("NWC_DNS_DUP"); dns_dup = (e&&*e)?atoi(e):3;
+                         if (dns_dup < 1) dns_dup = 1; if (dns_dup > 5) dns_dup = 5; }
+      for (int d = 0; d < dns_dup; d++) win_send_eth(h, mac, ssid, privacy, eth, 14+totlen); }
+    printf("[dns] '%s' type=%u -> %u.%u.%u.%u (authoritative)\n", qname, qtype,
+           (ans_ip>>24)&0xff,(ans_ip>>16)&0xff,(ans_ip>>8)&0xff,ans_ip&0xff);
+}
+
+static void win_send_eth(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy,
+                         const uint8_t *eth, int ethlen)
+{
+    if (ethlen < 14) return;
+    send_eth_to_ds(h, mac, ssid, privacy, eth+0, eth+6, (uint16_t)((eth[12]<<8)|eth[13]), eth+14, ethlen-14);
+}
+
+/* Answer the DS's ARP "who has the gateway" so it can send us IP traffic. */
+static void win_handle_arp(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy,
+                           const uint8_t *arp, int arplen, const uint8_t ds_mac[6])
+{
+    if (arplen < 28 || rdbe16(arp+6) != 1) return;      /* opcode 1 = request */
+    if (rdbe32(arp+24) != WNET_GW) return;              /* only answer for our gateway IP */
+    uint8_t out[42];
+    memcpy(out+0, ds_mac, 6); memcpy(out+6, GW_MAC, 6); wrbe16(out+12, 0x0806);
+    wrbe16(out+14, 1); wrbe16(out+16, 0x0800); out[18]=6; out[19]=4; wrbe16(out+20, 2);
+    memcpy(out+22, GW_MAC, 6); wrbe32(out+28, WNET_GW);
+    memcpy(out+32, ds_mac, 6); wrbe32(out+38, WNET_DS);
+    win_send_eth(h, mac, ssid, privacy, out, 42);
+}
+
+/* Answer the DS's DHCP DISCOVER/REQUEST from the in-probe server (hands out Wiimmfi DNS). */
+static void win_handle_dhcp(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy,
+                            const uint8_t *ip, int iplen, const uint8_t ds_mac[6])
+{
+    int ihl = (ip[0] & 0x0f) * 4; if (ihl < 20 || iplen < ihl + 8) return;
+    const uint8_t *udp = ip + ihl; const uint8_t *bootp = udp + 8;
+    int bootp_len = iplen - ihl - 8; if (bootp_len < 240) return;
+    uint32_t xid = rdbe32(bootp+4);
+    int msgtype = 0; const uint8_t *opt = bootp + 240, *end = bootp + bootp_len;
+    while (opt + 2 <= end && *opt != 0xff) {
+        if (*opt == 0) { opt++; continue; }
+        if (opt[0] == 53 && opt[1] >= 1) msgtype = opt[2];
+        opt += 2 + opt[1];
+    }
+    if (msgtype != 1 && msgtype != 3) return;           /* DISCOVER or REQUEST */
+    int reply = (msgtype == 1) ? 2 : 5;                 /* OFFER : ACK */
+    printf("[dhcp] %s from DS -> %s (192.168.44.20)\n", msgtype==1?"DISCOVER":"REQUEST", reply==2?"OFFER":"ACK");
+
+    uint8_t bp[300]; memset(bp, 0, sizeof bp);
+    bp[0]=2; bp[1]=1; bp[2]=6; wrbe32(bp+4, xid);
+    wrbe32(bp+16, WNET_DS); wrbe32(bp+20, WNET_GW);
+    memcpy(bp+28, ds_mac, 6);
+    bp[236]=0x63; bp[237]=0x82; bp[238]=0x53; bp[239]=0x63;
+    int o = 240;
+    bp[o++]=53; bp[o++]=1; bp[o++]=(uint8_t)reply;
+    bp[o++]=54; bp[o++]=4; wrbe32(bp+o, WNET_GW);   o+=4;
+    bp[o++]=51; bp[o++]=4; wrbe32(bp+o, 86400);     o+=4;
+    bp[o++]=1;  bp[o++]=4; wrbe32(bp+o, WNET_MASK); o+=4;
+    bp[o++]=3;  bp[o++]=4; wrbe32(bp+o, WNET_GW);   o+=4;
+    bp[o++]=6;  bp[o++]=4; wrbe32(bp+o, WNET_DNS);  o+=4;
+    bp[o++]=0xff;
+    int bplen = o;
+
+    uint8_t pkt[400];
+    int udplen = 8 + bplen, totlen = 20 + udplen;
+    memset(pkt, 0, 20);
+    pkt[0]=0x45; wrbe16(pkt+2, (uint16_t)totlen); pkt[8]=64; pkt[9]=17;
+    wrbe32(pkt+12, WNET_GW); wrbe32(pkt+16, WNET_DS);
+    wrbe16(pkt+10, inet_cksum(pkt, 20));
+    wrbe16(pkt+20, 67); wrbe16(pkt+22, 68);
+    wrbe16(pkt+24, (uint16_t)udplen); wrbe16(pkt+26, 0);
+    memcpy(pkt+28, bp, bplen);
+    uint8_t eth[420];
+    memcpy(eth+0, ds_mac, 6); memcpy(eth+6, GW_MAC, 6); wrbe16(eth+12, 0x0800);
+    memcpy(eth+14, pkt, totlen);
+    win_send_eth(h, mac, ssid, privacy, eth, 14 + totlen);
+}
+
+/* DS data frame -> decrypt -> Ethernet -> dispatch (ARP/DHCP in-probe; normal IP -> Wintun). */
+static void win_rx_dsdata(libusb_device_handle *h, const uint8_t *frame, int frame_len,
+                          const uint8_t mac[6], const char *ssid, bool privacy)
+{
+    if (!g_win_bridge || frame_len < 24) return;
+    uint16_t fc = get16(frame);
+    if (((fc >> 2) & 0x3) != 2) return;
+    uint8_t subtype = (uint8_t)((fc >> 4) & 0xf);
+    if (subtype & 0x4) return;
+    int hdrlen = 24; if (subtype & 0x8) hdrlen += 2;
+    bool prot = (fc & 0x4000) != 0;
+    if (frame_len < hdrlen + 8) return;
+    uint8_t swbuf[2320]; const uint8_t *plain=NULL; int plain_len=0;
+    if (prot) {
+        int off = hdrlen + 4, hw_len = frame_len - off - 4;
+        if (hw_len >= 8 && memcmp(frame+off, SNAP_HDR, 6)==0) { plain=frame+off; plain_len=hw_len; }
+        else { uint8_t wk[13]; derive_original_wep_key(ssid+12, wk); int pl=0;
+            if (wep_decrypt_body(frame+hdrlen, frame_len-hdrlen, wk, swbuf, (int)sizeof swbuf, &pl)
+                && pl>=8 && memcmp(swbuf, SNAP_HDR,6)==0){ plain=swbuf; plain_len=pl; } }
+    } else { int pl=frame_len-hdrlen;
+        if (pl>=8 && memcmp(frame+hdrlen, SNAP_HDR,6)==0){ plain=frame+hdrlen; plain_len=pl; } }
+    if (!plain || plain_len < 8) return;
+    const uint8_t *ds_mac = frame + 10;                 /* addr2 = SA (DS) */
+    uint16_t et = (uint16_t)((plain[6]<<8)|plain[7]);
+    const uint8_t *pay = plain + 8; int paylen = plain_len - 8;
+    g_last_ds_rx = GetTickCount();                      /* the DS is alive; keep the bridge open */
+    if (!g_sta_known){ memcpy(g_sta_mac, ds_mac, 6); g_sta_known=1;
+        printf("[bridge] learned DS station %02x:%02x:%02x:%02x:%02x:%02x\n",
+               ds_mac[0],ds_mac[1],ds_mac[2],ds_mac[3],ds_mac[4],ds_mac[5]);
+        /* The DS is now ASSOCIATED and sending data -- auth (whose precise auto-ACK timing forbids
+         * above-calibrated TX power) is finished. Our RX of the DS is clean but TX *to* it is
+         * marginal on Windows, so raise TX power to max for the data phase to lift the link margin
+         * (DHCP/DNS/conntest replies). Reverts to calibrated power only on a fresh AP restart.
+         * NWC_DATA_TXPOWER=n overrides (0 disables the boost). */
+        const char *bp = getenv("NWC_DATA_TXPOWER");
+        int boost = (bp && *bp) ? atoi(bp) : 31;
+        if (boost > 0) {
+            if (boost > 31) boost = 31;
+            config_channel_rf2525e(h, 1, (uint8_t)boost);
+            printf("[rf] data-phase TX power boosted to %d (post-association)\n", boost);
+        }
+    }
+    if (et == 0x0806) { win_handle_arp(h, mac, ssid, privacy, pay, paylen, ds_mac); return; }
+    if (et == 0x0800 && paylen >= 28 && (pay[0]&0xf0)==0x40) {
+        int ihl=(pay[0]&0x0f)*4;
+        printf("[rxip] proto=%u dst=%u.%u.%u.%u dport=%d len=%d\n", pay[9],
+               pay[16],pay[17],pay[18],pay[19],
+               ((pay[9]==17||pay[9]==6)&&paylen>=ihl+4)?rdbe16(pay+ihl+2):-1, paylen);
+        if (pay[9]==17 && paylen>=ihl+8 && rdbe16(pay+ihl+2)==67) {
+            win_handle_dhcp(h, mac, ssid, privacy, pay, paylen, ds_mac); return;
+        }
+        if (pay[9]==17 && paylen>=ihl+8 && rdbe16(pay+ihl+2)==53) {   /* DNS -> handle in-probe */
+            win_handle_dns(h, mac, ssid, privacy, pay, paylen, ds_mac); return;
+        }
+        /* Clear the re-send cache only when the DS's TCP ACK number reaches past the cached segment
+         * (it truly received it) -- NOT on any stray reply. Signed diff handles seq wraparound. */
+        if (g_synack.active && pay[9]==6 && rdbe32(pay+16)==g_synack.srv_ip
+            && paylen>=ihl+20 && rdbe16(pay+ihl+2)==g_synack.srv_port && (pay[ihl+13] & 0x10)) {
+            uint32_t ackno = rdbe32(pay+ihl+8);
+            if ((int32_t)(ackno - g_synack.end_seq) >= 0) {
+                g_synack.active = 0;
+                printf("[synack] DS ACKed %u.%u.%u.%u:%u (ack=%u >= %u) -> cache cleared\n",
+                       pay[16],pay[17],pay[18],pay[19], g_synack.srv_port, ackno, g_synack.end_seq);
+            }
+        }
+        /* Record the DS<->server flow so the return path can map the server's reply back. */
+        if ((pay[9]==6 || pay[9]==17) && paylen >= ihl+4)
+            rawret_note_flow(rdbe32(pay+16), rdbe16(pay+ihl+2), rdbe16(pay+ihl));
+        if (g_wd_active) {
+            /* Full userspace NAT: SNAT + WinDivertSend straight to the WAN, bypassing WinNAT (which
+             * unreliably swallows gamespy returns). The reply is captured by the WinDivert thread. */
+            wd_nat_outbound(pay, paylen);
+            printf("[bridge] DS->net (windivert) proto=%u dst=%u.%u.%u.%u len=%d\n",
+                   pay[9], pay[16],pay[17],pay[18],pay[19], paylen);
+        } else { BYTE *wp = pWtAlloc(g_wt_session, (DWORD)paylen);
+          if (wp){ memcpy(wp, pay, (size_t)paylen); pWtSend(g_wt_session, wp);
+              printf("[bridge] DS->net proto=%u dst=%u.%u.%u.%u len=%d\n",
+                     pay[9], pay[16],pay[17],pay[18],pay[19], paylen); }
+          else printf("[bridge] DS->net DROPPED (Wintun ring full) len=%d\n", paylen); }
+    }
+}
+
+/* Wintun -> IP packets (NAT return) -> Ethernet to the DS -> 802.11 + WEP. */
+static void win_poll_wintun(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy)
+{
+    if (!g_win_bridge || !g_sta_known) return;
+    /* If the DS has gone quiet (e.g. it left after an earlier attempt), stop forwarding: Windows
+     * keeps NAT-returning stale TCP retransmits to the old DS IP, and draining that flood -- with
+     * the TX pacing gap -- starves the beacon, so the DS can no longer even see the AP (51303). */
+    if ((GetTickCount() - g_last_ds_rx) > 6000u) {
+        g_sta_known = 0;
+        printf("[bridge] DS silent >6s -> closing bridge (stop forwarding stale traffic)\n");
+        return;
+    }
+    /* Drain the Wintun ring per call. The old cap of 4 was a Windows-only throttle (Linux used
+     * kernel NAT + TAP with no such limit) that could leave server->DS bursts backed up in the
+     * ring: during the GPCM login the server's challenge/response PLUS Windows NAT retransmits
+     * exceed 4/iteration, the ring overflows, a login segment is lost, and the DS reports 61010
+     * "communication error while logging in". Drain deeper (NWC_WT_DRAIN, default 16) so the
+     * ring stays empty; the beacon already went out at the top of the loop, so this can't delay
+     * the CURRENT beacon, and the per-frame TX is small. Count leftover backlog for diagnosis. */
+    static int wt_drain = -1;
+    if (wt_drain < 0) { const char *e = getenv("NWC_WT_DRAIN"); wt_drain = (e&&*e)?atoi(e):16;
+                        if (wt_drain < 4) wt_drain = 4; if (wt_drain > 64) wt_drain = 64; }
+    int i; for (i=0;i<wt_drain;i++){
+        DWORD sz=0; BYTE *p = pWtRecv(g_wt_session, &sz);
+        if (!p) break;
+        /* DIAG: log EVERY packet arriving on Wintun (pre-filter) from a gamespy/NAS server, so we can
+         * see whether New-NetNat delivered the 171-byte login result here at all (vs swallowed it). */
+        if (sz >= 20 && (p[0]&0xf0)==0x40) { uint32_t s=rdbe32(p+12), d=rdbe32(p+16);
+            if (s==0x5FD94D97u || s==0xBC22B1D9u || s==0x4E2EE79Bu) {   /* 95.217.77.151 / 188.34.177.217 / 78.46.231.155 */
+                static unsigned long ll=0; unsigned long nn=GetTickCount();
+                if (nn-ll>200u){ ll=nn; int ih=(p[0]&0xf)*4;
+                    printf("[wtrx] from %u.%u.%u.%u:%u -> %u.%u.%u.%u proto=%u len=%lu\n",
+                       (s>>24)&0xff,(s>>16)&0xff,(s>>8)&0xff,s&0xff, (sz>=(DWORD)(ih+2))?rdbe16(p+ih):0,
+                       (d>>24)&0xff,(d>>16)&0xff,(d>>8)&0xff,d&0xff, p[9], (unsigned long)sz); } } }
+        /* Only forward NAT-return traffic actually destined for the DS. Windows' own local
+         * services (ICS DNS proxy, NetBIOS/LLMNR/SSDP) spray UDP from the gateway IP and to
+         * broadcast/multicast onto this interface; forwarding that junk floods the DS and
+         * starves the RT2570's marginal TX path (it was crowding out our DHCP ACK). */
+        if (sz >= 20 && (p[0]&0xf0)==0x40 && 14 + (int)sz <= 1600
+            && rdbe32(p+16) == WNET_DS && rdbe32(p+12) != WNET_GW) {
+            uint8_t eth[1600];
+            memcpy(eth+0, g_sta_mac, 6); memcpy(eth+6, GW_MAC, 6); wrbe16(eth+12, 0x0800);
+            memcpy(eth+14, p, sz);
+            /* The downstream (net->DS) link is marginally lossy on Windows and retry_limit=0 means
+             * the hardware never retransmits, so larger NAS/HTTP responses are dropped and the DS
+             * stalls (52103) even though USB TX succeeds. Send each frame a couple of times; TCP
+             * silently discards the duplicates. NWC_TX_DUP overrides (1 = off). */
+            static int tx_dup = -1;
+            if (tx_dup < 0) { const char *e = getenv("NWC_TX_DUP"); tx_dup = (e&&*e)?atoi(e):2;
+                              if (tx_dup < 1) tx_dup = 1; if (tx_dup > 4) tx_dup = 4; }
+            for (int d = 0; d < tx_dup; d++) win_send_eth(h, mac, ssid, privacy, eth, 14 + (int)sz);
+            printf("[bridge] net->DS proto=%u src=%u.%u.%u.%u len=%lu x%d\n",
+                   p[9], p[12],p[13],p[14],p[15], (unsigned long)sz, tx_dup);
+            /* Cache a server->DS TCP SYN-ACK or PSH-data segment so we keep re-delivering it (Windows
+             * NAT won't). SYN-ACK completes the handshake; PSH data carries the gpcm challenge and the
+             * \lc\2\ login result -- both were being retransmitted by the server ~40x and lost. */
+            { int ihl2 = (p[0]&0x0f)*4; int fl = (sz >= (DWORD)(ihl2+14)) ? p[ihl2+13] : 0;
+              if (p[9]==6 && sz >= (DWORD)(ihl2+14) && ((fl & 0x12)==0x12 || (fl & 0x08))
+                  && (14 + (int)sz) <= (int)sizeof(g_synack.eth)) {
+                  int tcphl = ((p[ihl2+12]>>4)&0xf)*4;
+                  int plen = (int)sz - ihl2 - tcphl; if (plen < 0) plen = 0;
+                  uint32_t seq = rdbe32(p+ihl2+4);
+                  memcpy(g_synack.eth, eth, 14 + (int)sz); g_synack.len = 14 + (int)sz;
+                  g_synack.srv_ip = rdbe32(p+12); g_synack.srv_port = rdbe16(p+ihl2);
+                  g_synack.ds_port = rdbe16(p+ihl2+2);
+                  /* SYN and FIN each consume 1 seq; data consumes its length. Clear only once the DS
+                   * ACKs past this -> we keep re-delivering THIS exact segment (challenge, \lc\2\
+                   * result) until the DS truly has it, not merely until it sends some other ACK. */
+                  g_synack.end_seq = seq + (uint32_t)plen + (((fl & 0x02) || (fl & 0x01)) ? 1u : 0u);
+                  g_synack.last_send = GetTickCount(); g_synack.resends = 20; g_synack.active = 1;
+                  printf("[synack] cached %s from %u.%u.%u.%u:%u seq=%u+%u -> re-deliver until DS ACKs it\n",
+                         (fl & 0x08) ? "PSH-data" : "SYN-ACK", p[12],p[13],p[14],p[15],
+                         g_synack.srv_port, seq, (unsigned)plen); (void)plen;
+              } }
+        }
+        pWtRelease(g_wt_session, p);
+    }
+    /* Pump the cached SYN-ACK: re-send to the DS every ~150ms until it ACKs (cleared in
+     * win_rx_dsdata) or the bound is hit -- gives the DS the many delivery chances that Linux's
+     * kernel NAT provides but Windows' New-NetNat does not. Small frame, doesn't disturb beacon. */
+    if (g_synack.active && g_synack.resends > 0) {
+        unsigned long now = GetTickCount();
+        if (now - g_synack.last_send >= 150u) {
+            win_send_eth(h, mac, ssid, privacy, g_synack.eth, g_synack.len);
+            g_synack.last_send = now;
+            if (--g_synack.resends == 0) { g_synack.active = 0;
+                printf("[synack] re-delivery bound reached for :%u (DS never ACKed)\n", g_synack.srv_port); }
+        }
+    }
+    if (i >= wt_drain) {
+        static unsigned long last_backlog = 0; unsigned long now = GetTickCount();
+        if (now - last_backlog > 500u) { last_backlog = now;
+            printf("[bridge] net->DS drain hit cap %d (ring may be backing up)\n", wt_drain); }
+    }
+}
+
+/* ===================== RAW-SOCKET RETURN PATH (bypass New-NetNat) =====================
+ * pktmon proved New-NetNat systematically drops some server->DS segments (e.g. the 171-byte gpcm
+ * \lc\2\ login result) even though they arrive at the WAN NIC -- so the DS never gets them and login
+ * fails (61010). Instead of trusting New-NetNat's reverse delivery to Wintun, we sniff inbound
+ * packets straight off the WAN via a SIO_RCVALL raw socket, match them to a DS<->server flow, rewrite
+ * the destination back to the DS, and inject them ourselves. New-NetNat still handles the OUTBOUND
+ * SNAT (which works). Duplicates for segments New-NetNat also delivers are harmless (TCP dedups). */
+#ifndef SIO_RCVALL
+#define SIO_RCVALL 0x98000001
+#endif
+static SOCKET g_rawret = INVALID_SOCKET;
+static uint32_t g_wan_ip = 0;
+static struct { uint32_t srv_ip; uint16_t srv_port, ds_port; unsigned long tick; int used; } g_flows[64];
+
+/* Record a DS->server flow so the raw return path knows which DS port a server reply maps back to. */
+static void rawret_note_flow(uint32_t srv_ip, uint16_t srv_port, uint16_t ds_port)
+{
+    unsigned long now = GetTickCount();
+    for (int i = 0; i < 64; i++)
+        if (g_flows[i].used && g_flows[i].srv_ip==srv_ip && g_flows[i].srv_port==srv_port) {
+            g_flows[i].ds_port = ds_port; g_flows[i].tick = now; return;   /* newest DS port wins */
+        }
+    for (int i = 0; i < 64; i++)
+        if (!g_flows[i].used || now - g_flows[i].tick > 60000u) {
+            g_flows[i].srv_ip=srv_ip; g_flows[i].srv_port=srv_port; g_flows[i].ds_port=ds_port;
+            g_flows[i].tick=now; g_flows[i].used=1; return;
+        }
+}
+
+/* Full L4 checksum (TCP proto 6 / UDP proto 17) over the pseudo-header + segment. */
+static uint16_t l4_cksum(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *l4, int l4len)
+{
+    uint32_t sum = 0;
+    sum += (src>>16)&0xffff; sum += src&0xffff; sum += (dst>>16)&0xffff; sum += dst&0xffff;
+    sum += proto; sum += (uint32_t)l4len;
+    int i; for (i=0;i+1<l4len;i+=2) sum += (uint32_t)((l4[i]<<8)|l4[i+1]);
+    if (l4len&1) sum += (uint32_t)(l4[l4len-1]<<8);
+    while (sum>>16) sum=(sum&0xffff)+(sum>>16);
+    uint16_t c=(uint16_t)~sum; return (proto==17 && c==0) ? 0xffff : c;
+}
+
+static void rawret_open(void)
+{
+    if (env_on("NWC_NO_RAWRETURN")) { printf("[rawret] disabled (NWC_NO_RAWRETURN)\n"); return; }
+    /* Determine our WAN IP (the local address the default route uses). NWC_WAN_IP overrides. */
+    const char *we = getenv("NWC_WAN_IP");
+    if (we && *we) g_wan_ip = ntohl(inet_addr(we));
+    else {
+        SOCKET t = socket(AF_INET, SOCK_DGRAM, 0);
+        if (t != INVALID_SOCKET) {
+            struct sockaddr_in d; memset(&d,0,sizeof d); d.sin_family=AF_INET;
+            d.sin_port=htons(53); d.sin_addr.s_addr=htonl(0x08080808u);   /* 8.8.8.8 (no packet sent) */
+            if (connect(t,(struct sockaddr*)&d,sizeof d)==0) {
+                struct sockaddr_in l; int ll=sizeof l;
+                if (getsockname(t,(struct sockaddr*)&l,&ll)==0) g_wan_ip=ntohl(l.sin_addr.s_addr);
+            }
+            closesocket(t);
+        }
+    }
+    if (!g_wan_ip) { printf("[rawret] could not determine WAN IP; raw return OFF\n"); return; }
+    g_rawret = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    if (g_rawret == INVALID_SOCKET) { printf("[rawret] socket() failed %d (need admin); OFF\n", WSAGetLastError()); return; }
+    struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET; sa.sin_addr.s_addr=htonl(g_wan_ip);
+    if (bind(g_rawret,(struct sockaddr*)&sa,sizeof sa)!=0) { printf("[rawret] bind failed %d; OFF\n", WSAGetLastError()); closesocket(g_rawret); g_rawret=INVALID_SOCKET; return; }
+    DWORD inv=1, outv=0, br=0;
+    if (WSAIoctl(g_rawret, SIO_RCVALL, &inv,sizeof inv,&outv,sizeof outv,&br,NULL,NULL)!=0)
+        printf("[rawret] SIO_RCVALL failed %d (may still work)\n", WSAGetLastError());
+    u_long nb=1; ioctlsocket(g_rawret, FIONBIO, &nb);
+    printf("[rawret] raw return path ARMED on WAN %u.%u.%u.%u -- bypassing New-NetNat reverse delivery\n",
+           (g_wan_ip>>24)&0xff,(g_wan_ip>>16)&0xff,(g_wan_ip>>8)&0xff,g_wan_ip&0xff);
+}
+
+/* Poll the raw socket: for each inbound server->WAN packet matching a known DS flow, rewrite the
+ * destination to the DS and inject it. Called each main-loop iteration. */
+static void rawret_poll(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy)
+{
+    if (g_rawret==INVALID_SOCKET) return;
+    static uint8_t buf[65536];        /* full IP datagram; small buffer -> WSAEMSGSIZE drops packets */
+    static unsigned long g_rawrx_total = 0, g_rawrx_tous = 0, last_diag = 0;
+    { unsigned long nn=GetTickCount();
+      if (nn-last_diag > 5000u) { last_diag=nn;
+          printf("[rawret] diag: rawrx_total=%lu to_us=%lu (WAN=%u.%u.%u.%u)\n", g_rawrx_total, g_rawrx_tous,
+                 (g_wan_ip>>24)&0xff,(g_wan_ip>>16)&0xff,(g_wan_ip>>8)&0xff,g_wan_ip&0xff); } }
+    for (int n=0; n<128; n++) {
+        int r = recv(g_rawret, (char*)buf, sizeof buf, 0);
+        if (r <= 0) {
+            int e = WSAGetLastError();
+            if (e == WSAEMSGSIZE) continue;   /* oversized datagram truncated+removed -> keep draining */
+            break;                            /* WSAEWOULDBLOCK / other -> no more data this pass */
+        }
+        g_rawrx_total++;
+        if (r < 28 || (buf[0]&0xf0)!=0x40) continue;
+        int ihl=(buf[0]&0x0f)*4; if (ihl<20 || ihl+4>r) continue;
+        uint8_t proto=buf[9]; if (proto!=6 && proto!=17) continue;
+        uint32_t src=rdbe32(buf+12), dst=rdbe32(buf+16);
+        if (dst == g_wan_ip) g_rawrx_tous++;
+        if (dst != g_wan_ip) continue;                     /* only inbound destined to us */
+        uint16_t sport=rdbe16(buf+ihl), dport=rdbe16(buf+ihl+2);
+        /* DIAG: sample to_us TCP sources so we can see whether the gamespy/NAS server replies are
+         * even visible to the raw socket (vs consumed by New-NetNat's WFP layer first). */
+        if (proto==6) { static unsigned long ls=0; unsigned long nn=GetTickCount();
+            if (nn-ls > 700u) { ls=nn;
+                printf("[rawret] seen-tcp src=%u.%u.%u.%u:%u -> :%u (flows note gamespy replies here)\n",
+                       (src>>24)&0xff,(src>>16)&0xff,(src>>8)&0xff,src&0xff, sport, dport); } }
+        (void)dport;
+        /* Match a DS flow by (server ip, server port). */
+        uint16_t ds_port=0; int hit=-1;
+        for (int i=0;i<64;i++) if (g_flows[i].used && g_flows[i].srv_ip==src && g_flows[i].srv_port==sport) { ds_port=g_flows[i].ds_port; hit=i; break; }
+        if (hit<0) continue;
+        int iplen = rdbe16(buf+2); if (iplen>r) iplen=r;
+        if (14+iplen > 1600) continue;
+        /* Rewrite dst IP -> DS, dst port -> the DS's original port, fix checksums. */
+        wrbe32(buf+16, WNET_DS);
+        wrbe16(buf+ihl+2, ds_port);
+        wrbe16(buf+10, 0); wrbe16(buf+10, inet_cksum(buf,ihl));           /* IP header cksum */
+        int l4len = iplen - ihl;
+        if (proto==6 && l4len>=18) { wrbe16(buf+ihl+16,0); wrbe16(buf+ihl+16, l4_cksum(src,WNET_DS,6,buf+ihl,l4len)); }
+        else if (proto==17 && l4len>=8) { wrbe16(buf+ihl+6,0); wrbe16(buf+ihl+6, l4_cksum(src,WNET_DS,17,buf+ihl,l4len)); }
+        uint8_t eth[1600];
+        memcpy(eth+0, g_sta_mac, 6); memcpy(eth+6, GW_MAC, 6); wrbe16(eth+12,0x0800);
+        memcpy(eth+14, buf, (size_t)iplen);
+        win_send_eth(h, mac, ssid, privacy, eth, 14+iplen);
+        static unsigned long last_log=0; unsigned long now=GetTickCount();
+        if (now-last_log > 200u) { last_log=now;
+            printf("[rawret] inject srv %u.%u.%u.%u:%u -> DS:%u proto=%u len=%d\n",
+                   (src>>24)&0xff,(src>>16)&0xff,(src>>8)&0xff,src&0xff, sport, ds_port, proto, iplen); }
+    }
+}
+
+/* ===================== WINDIVERT RETURN PATH (the real New-NetNat bypass) =====================
+ * [wtrx] proof: New-NetNat delivers short-lived NAS/HTTP fully but SILENTLY SWALLOWS later packets on
+ * the persistent gamespy connection (delivered the 38-byte gpcm challenge, dropped the 171-byte \lc\2\
+ * login result) -- so the DS never completes login (61010). A SIO_RCVALL raw socket can't help because
+ * New-NetNat's WFP callout rewrites/consumes the return before the socket sees it. WinDivert installs
+ * its OWN WFP callout at the INBOUND IP-packet layer at high priority, so it intercepts the gamespy
+ * returns BEFORE New-NetNat, and we forward them to the DS ourselves -- exactly what Linux's kernel NAT
+ * does reliably. A capture thread does WinDivertRecv (blocking) + un-NAT and queues finished ethernet
+ * frames; the main loop drains the queue and does the (single-threaded) USB TX. NWC_NO_WINDIVERT off. */
+static HANDLE g_wd = NULL;                      /* INVALID_HANDLE_VALUE checked below */
+static CRITICAL_SECTION g_wd_cs;
+static struct { uint8_t f[1600]; int len; } g_wd_ring[256];
+static volatile int g_wd_head = 0, g_wd_tail = 0;
+static volatile unsigned long g_wd_seen = 0, g_wd_queued = 0, g_wd_sent = 0;
+
+/* SNAT the DS's outbound IP packet (src -> our WAN IP, DS port preserved) and inject it to the WAN via
+ * WinDivertSend. WinDivert injection bypasses Windows' raw-TCP send restriction, so this carries the
+ * DS's real TCP/UDP to the servers -- WinNAT is entirely out of the loop (it's the thing that dropped
+ * the gamespy returns). The reply comes back to WAN:ds_port and is captured by wd_thread. */
+static void wd_nat_outbound(const uint8_t *ip, int len)
+{
+    if (!g_wd || g_wd==INVALID_HANDLE_VALUE || len < 20 || len > 1500) return;
+    uint8_t pkt[1600]; memcpy(pkt, ip, (size_t)len);
+    /* MSS CLAMP on outbound SYNs: the DS advertises mss 536, so the gpcm server sends its 171-byte
+     * \lc\2\ login result as ONE ~245-byte 802.11 frame whose long air-time loses to gamespy-phase
+     * CCA spikes (the 38-byte challenge on the same link gets through). Clamping the advertised MSS
+     * makes the server split large responses into small frames (like the challenge) that survive.
+     * NWC_MSS overrides (0 disables). */
+    { int ih=(pkt[0]&0x0f)*4;
+      if (pkt[9]==6 && len>=ih+20 && (pkt[ih+13]&0x02)) {           /* TCP SYN */
+        static int clamp=-1; if(clamp<0){ const char *e=getenv("NWC_MSS"); clamp=(e&&*e)?atoi(e):120; }
+        if (clamp>0) { int thl=((pkt[ih+12]>>4)&0xf)*4, o=ih+20, endo=ih+thl;
+          while (o+1<endo && o+1<len) { uint8_t k=pkt[o];
+            if(k==0)break; if(k==1){o++;continue;}
+            uint8_t ol=pkt[o+1]; if(ol<2)break;
+            if(k==2 && ol==4 && o+3<len){ int m=(pkt[o+2]<<8)|pkt[o+3];
+              if(m>clamp){ pkt[o+2]=(uint8_t)(clamp>>8); pkt[o+3]=(uint8_t)clamp; } }
+            o+=ol; } } } }
+    wrbe32(pkt+12, g_wan_ip);                     /* SNAT source -> WAN IP (port unchanged) */
+    WINDIVERT_ADDRESS addr; memset(&addr, 0, sizeof addr);
+    addr.Layer = WINDIVERT_LAYER_NETWORK; addr.Event = WINDIVERT_EVENT_NETWORK_PACKET;
+    addr.Outbound = 1;
+    WinDivertHelperCalcChecksums(pkt, (UINT)len, &addr, 0);
+    UINT sent=0;
+    if (WinDivertSend(g_wd, pkt, (UINT)len, &sent, &addr)) g_wd_sent++;
+    else { static unsigned long le=0; unsigned long nn=GetTickCount();
+        if (nn-le>1000u){ le=nn; printf("[windivert] send err gle=%lu\n", GetLastError()); } }
+}
+
+static DWORD WINAPI wd_thread(LPVOID arg)
+{
+    (void)arg;
+    static uint8_t buf[65536];
+    WINDIVERT_ADDRESS addr; UINT rlen;
+    while (g_wd && g_wd != INVALID_HANDLE_VALUE) {
+        if (!WinDivertRecv(g_wd, buf, sizeof buf, &rlen, &addr)) { Sleep(1); continue; }
+        g_wd_seen++;
+        if (rlen < 28 || (buf[0]&0xf0)!=0x40) { WinDivertSend(g_wd, buf, rlen, NULL, &addr); continue; }
+        int ihl=(buf[0]&0x0f)*4; if (ihl<20) { WinDivertSend(g_wd, buf, rlen, NULL, &addr); continue; }
+        uint8_t proto=buf[9]; uint32_t src=rdbe32(buf+12), dst=rdbe32(buf+16);
+        uint16_t sport=rdbe16(buf+ihl);
+        int iplen = rdbe16(buf+2); if (iplen>(int)rlen) iplen=(int)rlen;
+        /* DIAG: log EVERY captured 95.217 packet (pre-match) so we can see if the 171 result is
+         * captured-but-unmatched vs never captured (WinDivert queue drop / outrun). */
+        if (src==0x5FD94D97u) { int pl=iplen-ihl-((proto==6)?(((buf[ihl+12]>>4)&0xf)*4):8);
+            printf("[wdcap] src=95.217:%u -> dst=%u.%u.%u.%u:%u proto=%u iplen=%d payload=%d flags=0x%02x\n",
+                   sport, (dst>>24)&0xff,(dst>>16)&0xff,(dst>>8)&0xff,dst&0xff, rdbe16(buf+ihl+2),
+                   proto, iplen, pl, (proto==6 && iplen>=ihl+14)?buf[ihl+13]:0); }
+        /* Reply from a server we NAT for, arriving at our WAN IP -> un-NAT to the DS. Match the flow
+         * by (server ip, server port); reinject anything that isn't a DS flow so the PC is untouched. */
+        uint16_t ds_port=0; int hit=0;
+        if (dst==g_wan_ip)
+            for (int i=0;i<64;i++) if (g_flows[i].used && g_flows[i].srv_ip==src && g_flows[i].srv_port==sport) { ds_port=g_flows[i].ds_port; hit=1; break; }
+        if (!hit || !g_sta_known || 14+iplen > 1600) { WinDivertSend(g_wd, buf, rlen, NULL, &addr); continue; }
+        wrbe32(buf+16, WNET_DS); wrbe16(buf+ihl+2, ds_port);   /* dst -> DS (port already preserved) */
+        /* Use WinDivert's own checksum helper (definitively correct) instead of a hand-rolled one --
+         * rules out any edge case on larger/odd segments like the 171-byte gpcm login result. */
+        { WINDIVERT_ADDRESS ca; memset(&ca,0,sizeof ca); ca.Layer=WINDIVERT_LAYER_NETWORK;
+          ca.Event=WINDIVERT_EVENT_NETWORK_PACKET;
+          WinDivertHelperCalcChecksums(buf, (UINT)iplen, &ca, 0); }
+        /* BARE-ACK storm-breaker: for a server->DS TCP DATA segment (PSH), also queue a headers-only
+         * copy (~40 bytes, no data, PSH cleared). That tiny frame carries the server's ACK of the DS's
+         * login and survives the OTA far better than the full data frame -- so the DS stops its own
+         * login-retransmit storm even while the data is still in flight, dropping CCA so the data can
+         * then land. NWC_NO_BAREACK disables. */
+        if (proto==6 && (buf[ihl+13]&0x08) && (buf[ihl+13]&0x10) && !env_on("NWC_NO_BAREACK")) {
+            int tcphl=((buf[ihl+12]>>4)&0xf)*4; int bl=ihl+tcphl;
+            if (bl>=40 && bl<=80) {
+                uint8_t bare[80]; memcpy(bare, buf, (size_t)bl);
+                wrbe16(bare+2, (uint16_t)bl);          /* IP total length = headers only */
+                bare[ihl+13] &= ~0x08;                 /* clear PSH (pure ACK) */
+                WINDIVERT_ADDRESS ca2; memset(&ca2,0,sizeof ca2); ca2.Layer=WINDIVERT_LAYER_NETWORK;
+                ca2.Event=WINDIVERT_EVENT_NETWORK_PACKET;
+                WinDivertHelperCalcChecksums(bare, (UINT)bl, &ca2, 0);
+                EnterCriticalSection(&g_wd_cs);
+                int nhb=(g_wd_head+1)%256;
+                if (nhb != g_wd_tail) { uint8_t *fb=g_wd_ring[g_wd_head].f;
+                    memcpy(fb, g_sta_mac,6); memcpy(fb+6, GW_MAC,6); wrbe16(fb+12,0x0800);
+                    memcpy(fb+14, bare, (size_t)bl); g_wd_ring[g_wd_head].len=14+bl; g_wd_head=nhb; g_wd_queued++; }
+                LeaveCriticalSection(&g_wd_cs);
+            }
+        }
+        { static unsigned long ll=0; unsigned long nn=GetTickCount();
+          if (nn-ll>120u){ ll=nn;
+            printf("[windivert] recv srv=%u.%u.%u.%u:%u -> DS:%u proto=%u len=%d (payload=%d)\n",
+                   (src>>24)&0xff,(src>>16)&0xff,(src>>8)&0xff,src&0xff, sport, ds_port, proto, iplen, iplen-ihl-((proto==6)?((buf[ihl+12]>>4)*4):8)); } }
+        EnterCriticalSection(&g_wd_cs);
+        int nh=(g_wd_head+1)%256;
+        if (nh != g_wd_tail) {
+            uint8_t *f=g_wd_ring[g_wd_head].f;
+            memcpy(f, g_sta_mac,6); memcpy(f+6, GW_MAC,6); wrbe16(f+12,0x0800);
+            memcpy(f+14, buf, (size_t)iplen); g_wd_ring[g_wd_head].len=14+iplen; g_wd_head=nh; g_wd_queued++;
+            /* Cache TCP PSH-data (gpcm challenge / \lc\2\ result) so the main-loop pump re-delivers it
+             * every ~120ms until the DS ACKs it -- the 211-byte result is lossy OTA under gamespy-phase
+             * CCA spikes and the server's own retransmit is a slow ~1s RTO, which spirals into a storm.
+             * Fast local re-delivery lets the DS ACK before the storm builds. Clears in win_rx_dsdata. */
+            if (env_on("NWC_WD_RESEND") && proto==6 && (buf[ihl+13]&0x08) && (14+iplen)<=(int)sizeof(g_synack.eth)) {
+                int tcphl=((buf[ihl+12]>>4)&0xf)*4; int plen=iplen-ihl-tcphl; if(plen<0)plen=0;
+                memcpy(g_synack.eth, f, 14+iplen); g_synack.len=14+iplen;
+                g_synack.srv_ip=src; g_synack.srv_port=sport; g_synack.ds_port=ds_port;
+                g_synack.end_seq=rdbe32(buf+ihl+4)+(uint32_t)plen;
+                g_synack.last_send=GetTickCount(); g_synack.resends=16; g_synack.active=1;
+            }
+        }
+        LeaveCriticalSection(&g_wd_cs);
+        /* DS-bound: consumed (not reinjected) -> we deliver it to the DS over USB */
+    }
+    return 0;
+}
+
+static void wd_open(void)
+{
+    if (env_on("NWC_NO_WINDIVERT")) { printf("[windivert] disabled (NWC_NO_WINDIVERT) -> Wintun+WinNAT path\n"); return; }
+    if (!g_wan_ip) {   /* determine WAN IP independently of rawret */
+        const char *we=getenv("NWC_WAN_IP");
+        if (we&&*we) g_wan_ip=ntohl(inet_addr(we));
+        else { SOCKET t=socket(AF_INET,SOCK_DGRAM,0);
+            if (t!=INVALID_SOCKET){ struct sockaddr_in d; memset(&d,0,sizeof d); d.sin_family=AF_INET;
+                d.sin_port=htons(53); d.sin_addr.s_addr=htonl(0x08080808u);
+                if (connect(t,(struct sockaddr*)&d,sizeof d)==0){ struct sockaddr_in l; int ll=sizeof l;
+                    if (getsockname(t,(struct sockaddr*)&l,&ll)==0) g_wan_ip=ntohl(l.sin_addr.s_addr); }
+                closesocket(t); } }
+    }
+    if (!g_wan_ip) { printf("[windivert] no WAN IP; full NAT OFF\n"); return; }
+    /* FULL userspace NAT at the NETWORK layer: we inject the DS's SNAT'd traffic outbound and capture
+     * the replies inbound HERE -- WinNAT is not in the path at all, so it can't swallow gamespy returns.
+     * Filter TIGHTLY to inbound from the Wiimmfi server IPs only (resolved now) -- a broad dst==WAN
+     * filter grabbed the PC's ENTIRE inbound (40k+ pkts), whose reinjection jittered USB/beacon timing
+     * and cost the DS visibility (51303). High priority so we see replies before the local stack RSTs
+     * them. NWC_WIIMMFI_IPS can add extra IPs (comma list). */
+    uint32_t wips[24]; int nw=0;
+    /* Seed with the known Wiimmfi server IPs so a momentary resolve miss can't drop a flow (Wiimmfi
+     * rotates NAS/conntest between 78.46.231.155 and 188.34.177.217; gamespy = 95.217.77.151). */
+    { uint32_t seed[]={0x4E2EE79Bu,0xBC22B1D9u,0x5FD94D97u}; for (unsigned k=0;k<3;k++) wips[nw++]=seed[k]; }
+    static const char *hn[] = { "nas.wiimmfi.de","gpcm.gs.wiimmfi.de","gpsp.gs.wiimmfi.de",
+        "conntest.wiimmfi.de","master.gs.wiimmfi.de","natneg1.gs.wiimmfi.de","sake.gs.wiimmfi.de",
+        "mariokartds.available.gs.wiimmfi.de" };
+    for (int i=0;i<(int)(sizeof hn/sizeof hn[0]) && nw<16;i++) {
+        struct addrinfo h2, *res=NULL; memset(&h2,0,sizeof h2); h2.ai_family=AF_INET;
+        if (getaddrinfo(hn[i], NULL, &h2, &res)==0 && res) {
+            uint32_t ip=ntohl(((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr);
+            int dup=0; for (int j=0;j<nw;j++) if (wips[j]==ip) dup=1;
+            if (!dup && ip) wips[nw++]=ip;
+        }
+        if (res) freeaddrinfo(res);
+    }
+    if (nw==0) { printf("[windivert] could not resolve any Wiimmfi IP; full NAT OFF (New-NetNat fallback)\n"); return; }
+    /* PEER-NAT WIDENING (Linux-parity fix). The DS's matchmaking hole-punches to ARBITRARY
+     * peer IPs over UDP (natneg, then P2P game traffic e.g. 190.6.7.157:13213) -- NOT just the
+     * fixed Wiimmfi server IPs. Linux's kernel MASQUERADE (conntrack) returns any peer reply
+     * transparently; the old fixed-SrcAddr filter here would DROP peer replies, so a race could
+     * never connect even after GPCM works. Fix: keep the tight TCP filter (server IPs only, so
+     * we don't grab the PC's TCP browsing) but ALSO capture all inbound UDP to our WAN IP
+     * (gamespy QR2/natneg + peer P2P). The g_flows table -- populated for EVERY DS outbound
+     * flow incl. peers -- lets wd_thread separate DS replies from the PC's own UDP (non-matching
+     * UDP is re-injected to the local stack). QUIC (srcport 443) is excluded so the PC's own web
+     * UDP adds no load. NWC_NO_WD_PEERS reverts to the old server-IPs-only behavior. */
+    int wd_peers = !env_on("NWC_NO_WD_PEERS");
+    char filter[640]; int fo=0;
+    fo += _snprintf(filter+fo, sizeof(filter)-fo, "inbound and ((tcp and (");
+    for (int i=0;i<nw;i++)
+        fo += _snprintf(filter+fo, sizeof(filter)-fo, "%sip.SrcAddr==%u.%u.%u.%u",
+                        i?" or ":"", (wips[i]>>24)&0xff,(wips[i]>>16)&0xff,(wips[i]>>8)&0xff,wips[i]&0xff);
+    fo += _snprintf(filter+fo, sizeof(filter)-fo, "))");
+    if (wd_peers) {
+        fo += _snprintf(filter+fo, sizeof(filter)-fo,
+                        " or (udp and ip.DstAddr==%u.%u.%u.%u and udp.SrcPort!=443)",
+                        (g_wan_ip>>24)&0xff,(g_wan_ip>>16)&0xff,(g_wan_ip>>8)&0xff,g_wan_ip&0xff);
+    } else {
+        fo += _snprintf(filter+fo, sizeof(filter)-fo, " or (udp and (");
+        for (int i=0;i<nw;i++)
+            fo += _snprintf(filter+fo, sizeof(filter)-fo, "%sip.SrcAddr==%u.%u.%u.%u",
+                            i?" or ":"", (wips[i]>>24)&0xff,(wips[i]>>16)&0xff,(wips[i]>>8)&0xff,wips[i]&0xff);
+        fo += _snprintf(filter+fo, sizeof(filter)-fo, "))");
+    }
+    _snprintf(filter+fo, sizeof(filter)-fo, ")");
+    g_wd = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 1000, 0);
+    if (g_wd == INVALID_HANDLE_VALUE) {
+        g_wd = NULL;
+        printf("[windivert] open FAILED gle=%lu (driver load blocked? need admin / AV allow)\n", GetLastError());
+        return;
+    }
+    WinDivertSetParam(g_wd, WINDIVERT_PARAM_QUEUE_LENGTH, WINDIVERT_PARAM_QUEUE_LENGTH_MAX);
+    WinDivertSetParam(g_wd, WINDIVERT_PARAM_QUEUE_TIME, WINDIVERT_PARAM_QUEUE_TIME_MAX);
+    InitializeCriticalSection(&g_wd_cs);
+    CreateThread(NULL, 0, wd_thread, NULL, 0, NULL);
+    g_wd_active = 1;
+    printf("[windivert] FULL NAT ARMED (WinNAT bypassed): DS<->WAN via WinDivert, filter='%s'\n", filter);
+}
+
+static void wd_drain(libusb_device_handle *h, const uint8_t mac[6], const char *ssid, bool privacy)
+{
+    if (!g_wd || g_wd == INVALID_HANDLE_VALUE) return;
+    { static unsigned long ld=0; unsigned long nn=GetTickCount();
+      if (nn-ld>3000u){ ld=nn; printf("[windivert] diag: sent=%lu seen=%lu queued=%lu\n", g_wd_sent, g_wd_seen, g_wd_queued); } }
+    /* Cap injections PER main-loop iteration so a gamespy burst can't monopolise the single USB TX
+     * engine and starve the ~75ms beacon (a beacon stall drops the DS mid-session). Leftover frames
+     * stay queued (max WinDivert queue) and drain over the next iterations. NWC_WD_DRAIN overrides. */
+    static int wdd = -1;
+    if (wdd < 0) { const char *e=getenv("NWC_WD_DRAIN"); wdd=(e&&*e)?atoi(e):8; if (wdd<2) wdd=2; if (wdd>64) wdd=64; }
+    for (int k=0;k<wdd;k++) {
+        uint8_t f[1600]; int len=0;
+        EnterCriticalSection(&g_wd_cs);
+        if (g_wd_tail != g_wd_head) { len=g_wd_ring[g_wd_tail].len; memcpy(f,g_wd_ring[g_wd_tail].f,(size_t)len); g_wd_tail=(g_wd_tail+1)%256; }
+        LeaveCriticalSection(&g_wd_cs);
+        if (!len) break;
+        /* Send each server->DS frame twice: the dongle->DS OTA hop is lossy under the gamespy-phase
+         * CCA spikes, and a lost gpcm result forces the server's slow ~1s retransmit -> retransmit
+         * storm -> CCA spike -> beacon stall -> dropped connection. Two immediate copies let the DS
+         * ACK on the first exchange so GPCM completes before the storm builds. NWC_WD_DUP overrides. */
+        static int wddup=-1; if (wddup<0){ const char *e=getenv("NWC_WD_DUP"); wddup=(e&&*e)?atoi(e):2; if(wddup<1)wddup=1; if(wddup>3)wddup=3; }
+        for (int d=0; d<wddup; d++) win_send_eth(h, mac, ssid, privacy, f, len);
+        static unsigned long ll=0; unsigned long nn=GetTickCount();
+        if (nn-ll>200u){ ll=nn; uint8_t *ip=f+14; int ih=(ip[0]&0xf)*4;
+            printf("[windivert] inject -> DS proto=%u sport=%u len=%d x%d\n", ip[9], rdbe16(ip+ih), len-14, wddup); }
+    }
+}
+#endif /* _WIN32 */
+
 static int send_probe_response(libusb_device_handle *handle, const uint8_t mac[6],
                                const uint8_t dst[6], const char *ssid, uint8_t channel,
                                bool privacy)
@@ -1422,8 +2570,8 @@ static int send_auth_response(libusb_device_handle *handle, const uint8_t mac[6]
      * TX-enable/autonomous bit (radio only inserts TSF for beacon/proberesp subtypes) rather
      * than a corrupting timestamp-insert. NWC_AUTH_NOACK=1 makes seq2 fire-and-forget so the
      * single TX engine doesn't stall waiting on the DS ACK. */
-    bool auth_ts   =  (getenv("NWC_AUTH_TS")    && *getenv("NWC_AUTH_TS"));
-    bool auth_ack  = !(getenv("NWC_AUTH_NOACK") && *getenv("NWC_AUTH_NOACK"));
+    bool auth_ts   =  (env_on("NWC_AUTH_TS"));
+    bool auth_ack  = !(env_on("NWC_AUTH_NOACK"));
     return send_80211_frame(handle, frame, frame_len, auth_ts, auth_ack, "auth-response");
 }
 
@@ -1494,12 +2642,25 @@ static bool should_answer_probe(const uint8_t *frame, int frame_len, const char 
      * capture shows ~0 probe-responses during the auth window, and answering them all
      * (tx=9673 in our logs) keeps the single TX engine busy and blocks the DS's auth
      * SIFS auto-ACK. Passive discovery still works via the beacon. NWC_ALLPROBE = answer all. */
-    if (getenv("NWC_ALLPROBE") && *getenv("NWC_ALLPROBE"))
+    if (env_on("NWC_ALLPROBE"))
         return true;
     int ie = mgmt_ie_offset(frame, frame_len);
     if (ie >= 0 && ie + 2 + 8 <= frame_len && frame[ie] == 0 && frame[ie + 1] >= 8 &&
         memcmp(frame + ie + 2, "NWCUSBAP", 8) == 0)
         return true;
+    /* DISCOVERY-phase answer: the DS's active scan sends BROADCAST/wildcard probe-requests
+     * (SSID IE len 0) BEFORE it has found us, and if it also misses the beacon window it
+     * reports 51303 "can't see it" — exactly the dark-recovered-dongle failure. So while we
+     * are NOT in the auth window (no auth frame from any station in the last 2s), answer
+     * broadcast probes too. probe_throttled() (NWC_PROBE_MINGAP_MS, default 300ms) already
+     * caps this to ~3/s per station, so it can't storm the single TX engine; and once auth
+     * begins g_last_auth_rx gates it right back off so the seq1 SIFS auto-ACK is protected.
+     * NWC_NO_DISCPROBE disables. */
+    if (!env_on("NWC_NO_DISCPROBE") && (GetTickCount() - g_last_auth_rx) > 2000u) {
+        int wlen = (ie >= 0 && ie + 1 < frame_len) ? frame[ie + 1] : -1;
+        if (wlen == 0)   /* wildcard/broadcast probe */
+            return true;
+    }
     return false;
 }
 
@@ -1568,7 +2729,7 @@ static bool auth_answered_recently(const uint8_t src[6], uint16_t seq)
 {
     static struct { uint8_t mac[6]; uint16_t seq; unsigned long tick; int used; } tbl[16];
     unsigned long now = GetTickCount();
-    if (getenv("NWC_NODEDUP") && *getenv("NWC_NODEDUP")) return false;
+    if (env_on("NWC_NODEDUP")) return false;
     for (int i = 0; i < 16; i++)
         if (tbl[i].used && tbl[i].seq == seq && memcmp(tbl[i].mac, src, 6) == 0) {
             if (now - tbl[i].tick < 800u) return true;   /* answered this (src,seq) < 800ms ago */
@@ -1590,6 +2751,22 @@ static void maybe_answer_management(libusb_device_handle *handle, const uint8_t 
         return;
 
     const uint8_t *src = frame + 10;
+
+    /* ACTIVE-CONNECTION GUARD (Windows crash fix): once a DS is associated and
+     * we're bridging its data (g_sta_known), IGNORE management frames from any
+     * OTHER station. A neighbour's active-scan probe flood (subtype 4) would
+     * otherwise each cost a synchronous libusbK probe-response TX of hundreds
+     * of ms, stalling the main loop up to ~2s (observed: rxdrain 1985ms). That
+     * stall starves the DS's uplink: its GPCM ACKs never reach Wiimmfi, the
+     * server retransmits everything (42 SYN-ACK / 1638 keepalive-ACK / data x6+),
+     * and the DS's IP stack eventually crashes deep in the handshake. Linux
+     * absorbs the flood (usbfs = microseconds); Windows sync-TX cannot. Our own
+     * DS's frames (re-auth / re-assoc / re-probe) still pass. The guard lifts the
+     * instant the DS drops (win_poll_wintun's 6s-silence clears g_sta_known). */
+    if (g_sta_known && !env_on("NWC_ANSWER_FOREIGN_MGMT") &&
+        memcmp(src, g_sta_mac, 6) != 0)
+        return;
+
     if (should_answer_probe(frame, frame_len, ssid)) {
         /* Plain probe-response with our connector SSID (byte9=space, real 20
          * digits). This is exactly what commit 82ba5e8 used to get the DS's
@@ -1677,6 +2854,7 @@ static void maybe_answer_management(libusb_device_handle *handle, const uint8_t 
         uint16_t alg = get16(auth);
         uint16_t seq = get16(auth + 2);
         uint16_t status = get16(auth + 4);
+        g_last_auth_rx = GetTickCount();   /* now in the auth window -> broadcast probes go silent */
         printf("[auth] request from %02x:%02x:%02x:%02x:%02x:%02x alg=%u seq=%u status=%u\n",
                src[0], src[1], src[2], src[3], src[4], src[5], alg, seq, status);
         if (auth_answered_recently(src, seq)) {
@@ -1692,7 +2870,7 @@ static void maybe_answer_management(libusb_device_handle *handle, const uint8_t 
              * libusb TX path (a short seq2 does). NWC_AUTH_NOCHAL sends a challenge-less seq2
              * that DOES radiate — the DS self-derives the WEP key per the connector flow, so
              * it may accept it and advance to seq3. */
-            bool nochal = (getenv("NWC_AUTH_NOCHAL") && *getenv("NWC_AUTH_NOCHAL"));
+            bool nochal = (env_on("NWC_AUTH_NOCHAL"));
             send_auth_response(handle, mac, src, alg, 2, 0, !nochal);
         } else if (alg == 1 && seq == 3) {
             /* Send seq4=success UNCONDITIONALLY on seq3 — the gold XP capture shows
@@ -1810,9 +2988,21 @@ static bool is_interesting_frame(const uint8_t *frame, int frame_len,
     return false;
 }
 
+static int nwc_quiet(void)
+{
+    static int q = -1;
+    if (q < 0) { const char *e = getenv("NWC_QUIET"); q = (e && *e) ? 1 : 0; }
+    return q;
+}
+
 static void log_80211_frame(const uint8_t *frame, int frame_len, const char *source,
                             const uint8_t *ap_mac, const char *ap_ssid)
 {
+    /* NWC_QUIET: suppress the verbose per-frame logger (hexdumps + field decode).
+     * Under load this emits many KB/frame; if the buffered write flushes mid-loop it
+     * can block the main loop on disk I/O -- a candidate for the residual multi-second
+     * stall. Keeping [stall]/diag/delivery markers lets us tell logging-stall from real. */
+    if (nwc_quiet()) return;
     if (frame_len < 24) {
         printf("[rx] %s short raw frame len=%d\n", source, frame_len);
         hexdump(frame, frame_len < 96 ? frame_len : 96);
@@ -1837,7 +3027,7 @@ static void log_80211_frame(const uint8_t *frame, int frame_len, const char *sou
            frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
            frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
     if (registration_hint)
-        printf("[rx] *** registration hint matched: PlayerName/Nintendo/NWCUSB bytes present ***\n");
+        printf("[rx] *** registration hint matched: Nintendo/NWCUSB bytes present ***\n");
 
     uint8_t subtype = (uint8_t)((fc >> 4) & 0xf);
     if (subtype == 4)
@@ -1901,6 +3091,8 @@ static void log_rx_packet(libusb_device_handle *handle, const uint8_t *buf, int 
             maybe_answer_management(handle, buf, len, ap_mac, ap_ssid, channel, privacy);
 #ifndef _WIN32
             tap_rx_dsdata(buf, len, ap_ssid);
+#else
+            win_rx_dsdata(handle, buf, len, ap_mac, ap_ssid, privacy);
 #endif
         }
         return;
@@ -1933,6 +3125,8 @@ static void log_rx_packet(libusb_device_handle *handle, const uint8_t *buf, int 
             maybe_answer_management(handle, frame, frame_avail, ap_mac, ap_ssid, channel, privacy);
 #ifndef _WIN32
             tap_rx_dsdata(frame, frame_avail, ap_ssid);
+#else
+            win_rx_dsdata(handle, frame, frame_avail, ap_mac, ap_ssid, privacy);
 #endif
         }
     } else {
@@ -1991,7 +3185,7 @@ static int config_ap_regs(libusb_device_handle *handle, const uint8_t mac[6])
      * and the MAC address existed, so the responder never armed (DS auths but never
      * gets a hardware ACK -> 51301/51303). NWC_OLDAWAKE restores the old early edge.
      */
-    if (!(getenv("NWC_OLDAWAKE") && *getenv("NWC_OLDAWAKE"))) {
+    if (!(env_on("NWC_OLDAWAKE"))) {
         /* Zero MAC_CSR18 (wakeup timer: DELAY_AFTER_BEACON/BEACONS_BEFORE_WAKEUP/
          * AUTO_WAKE) IMMEDIATELY before the AWAKE transition — the gold XP capture's
          * register STATE does exactly this (MAC_CSR18<=0x0000 at fr1397, then MAC_CSR17
@@ -2277,7 +3471,7 @@ static int basic_init(libusb_device_handle *handle)
      */
     read16(handle, MAC_CSR1, &reg);
     write16(handle, MAC_CSR1, (reg & (uint16_t)~0x0003) | 0x0004);   /* HOST_READY */
-    if (getenv("NWC_OLDAWAKE") && *getenv("NWC_OLDAWAKE")) {
+    if (env_on("NWC_OLDAWAKE")) {
         printf("[init] NWC_OLDAWAKE: firing AWAKE early (pre-PHY) for regression\n");
         set_state_awake(handle);
     } else {
@@ -2451,9 +3645,14 @@ static int beacon_once(libusb_device_handle *handle, uint8_t channel, const char
  */
 static libusb_context *g_ctx = NULL;
 
-#define RX_URB_COUNT 8
+/* Deep RX pipeline. On the Linux kernel/libusb path 8 URBs suffice, but on Windows/libusbK a DS
+ * data burst fills the URBs faster than the busy main loop re-arms them, so the dongle's internal
+ * RX FIFO overflows (observed STA_CSR4 "RXFIFO" spiking to ~10000) and the MAC wedges -> "goes dark
+ * after a successful communication". Far more in-flight URBs + a deeper queue absorb the burst so
+ * the hardware FIFO never overruns. NWC_RX_URBS overrides the count at runtime. */
+#define RX_URB_COUNT 128
 #define RX_URB_SIZE  4096
-#define RXQ_SIZE     64
+#define RXQ_SIZE     512
 
 struct rx_frame { uint8_t buf[RX_URB_SIZE]; int len; };
 static struct rx_frame g_rxq[RXQ_SIZE];
@@ -2616,7 +3815,7 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
                (sta5b != sta5a) ? "COUNTING (hw beacon/TSF alive)" : "STUCK (hw beacon/TSF DEAD)");
     }
 
-    if (getenv("NWC_APSTART") && *getenv("NWC_APSTART")) {
+    if (env_on("NWC_APSTART")) {
         /*
          * Original AP-START responder-arming tail (rt25usbap.sys 0x1fb90): the
          * CLOSING action of SoftAP activation is a hard RX disable -> 100ms
@@ -2660,6 +3859,12 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
     }
 
     unsigned long last_beacon = GetTickCount();
+    /* Software beacon cadence. Default 75ms (faster than the 100ms standard) so that even with CCA
+     * back-off from a busy channel, the *radiated* rate stays high enough that the DS's brief
+     * per-channel scan never lands in a gap (fixes the intermittent 51099 "can't see it"). The
+     * advertised beacon-interval IE stays 100 TU; we just emit a bit more often. NWC_BEACON_MS tunes. */
+    unsigned beacon_ms = 75;
+    { const char *e = getenv("NWC_BEACON_MS"); if (e && *e) { int v = atoi(e); if (v >= 20 && v <= 200) beacon_ms = (unsigned)v; } }
     unsigned long last_hw_refresh = last_beacon;
     /* NWC_NOSWBEACON: rely ONLY on the hardware beacon generator (BEACON_GEN),
      * suppressing the ~100ms software beacon. Frees the single TX engine so the
@@ -2670,10 +3875,21 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
     /* NWC_DATAPATH: bridge the DS's data traffic to the internet. Attach to the pre-created TAP
      * (default nwc0; NWC_TAP overrides) so DHCP (dnsmasq on nwc0) + NAT (iptables) carry the DS
      * online. Getting past 52003 needs this — the probe was management-only before. */
-    if (getenv("NWC_DATAPATH") && *getenv("NWC_DATAPATH")) {
+    if (env_on("NWC_DATAPATH")) {
         const char *tn = getenv("NWC_TAP"); if (!tn || !*tn) tn = "nwc0";
         g_tap_fd = tap_open(tn);
         if (g_tap_fd >= 0) printf("[bridge] DS<->internet data path ENABLED via %s\n", tn);
+    }
+#else
+    /* NWC_DATAPATH (Windows): create the Wintun adapter + in-probe DHCP/ARP; New-NetNat carries it. */
+    if (env_on("NWC_DATAPATH")) {
+        if (win_datapath_init() == 0)
+            printf("[bridge] DS<->internet data path ENABLED via Wintun 'NWC-DS'\n");
+        dns_init_prewarm(); /* resolve every gamespy name NOW (off the packet thread) + start the
+                             * async resolver, so win_handle_dns never blocks ap_loop on getaddrinfo
+                             * (the stall that stranded the 45-byte GPCM segment; Linux resolves async) */
+        rawret_open();   /* arm the raw-socket return path (bypasses New-NetNat's flaky reverse delivery) */
+        wd_open();       /* arm WinDivert: intercept gamespy returns before New-NetNat swallows them */
     }
 #endif
     /* NWC_HWBEACON: load the beacon into the RT2570 HARDWARE beacon buffer (0x2c00) so the
@@ -2706,7 +3922,7 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
 #ifdef NWC_BACKEND_KMDF
     unsigned long last_stats = last_beacon;
     kmdf_print_stats("-init");
-    if (getenv("NWC_KERNMAC") && *getenv("NWC_KERNMAC")) {
+    if (env_on("NWC_KERNMAC")) {
         /* FULL-MAC-PORT mode: hand the AP config to the KERNEL responder, which now owns
          * the beacon + ALL probe/auth/assoc/connector-grant responses (operating in-kernel
          * like rt2500usb, not over IOCTL round-trips). User mode is policy-only from here. */
@@ -2723,6 +3939,24 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
     }
 #endif
     for (;;) {
+        /* Per-iteration wall-clock: catches a single loop pass that stalled on a blocking libusbK
+         * sync TX (the thing that would inflate the cleared-on-read CCA counter). */
+        { static unsigned long g_iter_prev = 0; unsigned long inow = GetTickCount();
+          if (g_iter_prev) { unsigned long it = inow - g_iter_prev; if (it > g_loop_max) g_loop_max = it; }
+          g_iter_prev = inow; }
+        /* SECTION TIMER: find which part of one loop pass blocks for seconds. */
+        unsigned long _sT = GetTickCount();
+        #define CHK(n) do { unsigned long _d = GetTickCount()-_sT; if(_d>300) printf("[stall] %s %lums\n", n, _d); _sT = GetTickCount(); } while(0)
+        /* BEACON PRIORITY: emit the beacon FIRST, before the (synchronous, libusbK-blocking) RX
+         * drain + downstream data TX. Otherwise a DS data burst stretches the loop iteration, the
+         * beacon misses its ~100ms slot, and the DS momentarily loses the AP ("goes dark"). The
+         * NUC/kernel path doesn't block like this; this is the TX-side mirror of the deep-RX fix. */
+        { unsigned long bnow = GetTickCount();
+          if (!no_sw_beacon && beacon_len && (bnow - last_beacon) >= beacon_ms) {
+              send_80211_frame(handle, beacon_frame, beacon_len, true, false, "beacon-sw");
+              last_beacon = bnow;
+          } }
+        CHK("beacon");
         if (runtime_loop) {
             /* STA_CSR DIAGNOSTIC: dump the RT2570 statistics counters (0x04e0-0x04f4,
              * cleared-on-read so each print is the delta since last). c6..c10 are the
@@ -2731,24 +3965,153 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
              * splitting "DS never gets seq2" from "seq1 auto-ACK is the wall". */
             unsigned long nrt = GetTickCount();
             if (nrt - last_rt >= rt_ms) {
-                uint16_t s[11]; int k;
-                for (k = 0; k < 11; k++) { s[k] = 0; read16(handle, (uint16_t)(0x04e0 + k*2), &s[k]); }
-                printf("[stacsr] FCS=%u PLCP=%u LONG=%u CCA=%u RXFIFO=%u BCN=%u c6=%u c7=%u c8=%u c9=%u c10=%u\n",
-                       s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],s[8],s[9],s[10]);
+                uint16_t s[11]; memset(s, 0, sizeof s);
+                /* Read ONLY the two counters we use -- CCA (for the link tuner) + RXFIFO + BCN.
+                 * The old full 11-register dump was 11 synchronous control transfers every interval,
+                 * which blocked the loop long enough to jitter the ~100ms beacon cadence (0.2-0.3s
+                 * gaps the DS scan misses). NWC_FULL_STACSR restores the full dump for diagnosis. */
+                if (env_on("NWC_FULL_STACSR")) {
+                    int k; for (k = 0; k < 11; k++) read16(handle, (uint16_t)(0x04e0 + k*2), &s[k]);
+                } else {
+                    read16(handle, 0x04e6, &s[3]);   /* STA_CSR3 = CCA (always) */
+                    /* Each read16 is a ~10ms libusbK SYNC control transfer that stalls the loop and
+                     * jitters the beacon. During a LIVE connection we only need CCA (the diagnostic);
+                     * RXFIFO/BCN feed the discovery-only recovery, so read them ONLY when discovering. */
+                    if (!g_sta_known) {
+                        read16(handle, 0x04e8, &s[4]);   /* STA_CSR4 = RXFIFO */
+                        read16(handle, 0x04ea, &s[5]);   /* STA_CSR5 = BCN   */
+                    }
+                }
+                /* dt = actual ms since last read. CCA is cleared-on-read, so a big dt inflates the
+                 * count: if a "CCA spike" comes with dt >> rt_ms, it's a LOOP STALL (libusbK sync TX
+                 * blocking), not real RF. g_loop_max = worst single main-loop iteration since last read. */
+                unsigned long dt = nrt - last_rt;
+                extern volatile unsigned long g_loop_max;
+                printf("[stacsr] FCS=%u PLCP=%u LONG=%u CCA=%u RXFIFO=%u BCN=%u dt=%lums loopmax=%lums CCA/150ms=%lu\n",
+                       s[0],s[1],s[2],s[3],s[4],s[5], dt, g_loop_max,
+                       dt ? (unsigned long)((unsigned long long)s[3]*150ull/dt) : (unsigned long)s[3]);
+                g_loop_max = 0;
                 last_rt = nrt;
+                /* Stall detection + auto-recovery. s[5]=STA_CSR5 is the beacon-sent counter and this
+                 * block is now its only reader, so several consecutive zero intervals is a genuine
+                 * RT2570 carrier-sense jam (not a read race). Re-init alone doesn't clear it; a
+                 * USB-level reset does. Recover in place so a connection survives. Require a long
+                 * run of zeros so we never reset mid-auth. NWC_NO_AUTORECOVER disables. */
+                { static int bstall = 0;
+                  if (s[5] == 0) bstall++; else bstall = 0;
+                  /* Only recover when the beacon engine is dark AND the DS is NOT actively talking.
+                   * That's the fix for both failure modes: it heals the genuine post-burst TX-engine
+                   * stall (dongle goes dark after gamespy, DS then can't see it -> 51099/51303) yet
+                   * never fires mid-connection on transient burst CCA back-off (which used to USB-
+                   * reset and drop a live connection -> 52003). g_last_ds_rx is the DS's last DATA
+                   * frame; during the scan it stays old (probe-reqs don't touch it), so a start-up
+                   * dark still recovers. NWC_NO_AUTORECOVER disables entirely. */
+                  int ds_quiet = (GetTickCount() - g_last_ds_rx) > 2500u;
+                  /* NEVER reset while a DS is associated (g_sta_known): a USB reset kills a LIVE
+                   * gamespy/online session mid-flight (this dropped a green connection -> 61010). If
+                   * the DS truly drops, win_poll_wintun's 6s-silence check clears g_sta_known first,
+                   * and only THEN may we recover for the next attempt. So recovery is discovery-only. */
+                  if (bstall >= 8 && ds_quiet && !g_sta_known && !env_on("NWC_NO_AUTORECOVER")) {
+                      printf("[recover] beacon dark %d intervals + DS quiet + not-associated -> USB reset + re-init\n", bstall);
+                      int rrc = libusb_reset_device(handle);
+                      printf("[recover] libusb_reset_device rc=%d (%s)\n", rrc, libusb_error_name(rrc));
+                      if (rrc == LIBUSB_ERROR_NOT_FOUND || rrc == LIBUSB_ERROR_NO_DEVICE) {
+                          printf("[recover] device re-enumerated; exiting for clean relaunch\n"); return; }
+                      libusb_claim_interface(handle, 0);
+                      radio_init(handle, channel);
+                      config_ap_regs(handle, mac);
+                      if (hw_beacon) hw_load_beacon(handle, mac, ssid, channel, privacy, on, off);
+                      else send_beacon_and_enable(handle, mac, ssid, channel, on, off, privacy);
+                      g_sta_known = 0;
+                      bstall = 0;
+                  } }
+                /* Dynamic CCA link-tuner (mirrors rt2500usb_link_tuner): continuously trim BBP R17
+                 * against the false-CCA count so the carrier-sense doesn't jam. s[3]=CCA count this
+                 * interval. High CCA -> raise R17 (less sensitive); quiet -> lower it (recover
+                 * sensitivity). Keeps the beacon/TX engine winning channel access. NWC_NO_CCATUNE off. */
+                if (!env_on("NWC_NO_CCATUNE")) {
+                    static int cur_r17 = 0;
+                    if (cur_r17 == 0) { const char *e=getenv("NWC_BBP_R17"); cur_r17=(e&&*e)?(int)strtol(e,NULL,0):0x38; }
+                    /* Cap raised 0x40 -> 0x54 (NWC_R17_CAP): the DS sits at ~-38 dBm (very strong),
+                     * so the radio can run a much higher carrier-sense/ED threshold -- ignoring the
+                     * intermittent 2.4GHz noise that spikes CCA to ~800 and defers our beacon (DS
+                     * then "can't see it" -> 51303) -- without going deaf to the DS. Empirically the
+                     * runs that reached gamespy had CCA ~584; when it climbs to ~800 the old 0x40
+                     * cap wasn't enough to keep the beacon winning channel access. Step harder on a
+                     * big spike so we recover fast. Floor unchanged so a quiet channel restores full
+                     * sensitivity. NWC_R17_CAP overrides the ceiling; NWC_NO_CCATUNE disables. */
+                    /* BALANCE, not maximum. R17 is BOTH the CCA/TX-defer threshold AND the RX
+                     * sensitivity: too low -> the beacon defers on a noise spike (51303); too high
+                     * -> the radio goes DEAF to the DS's probe/auth frames (also 51303 -- pushing the
+                     * cap to 0x62 drove R17 to 0x5f, CCA read ~0, and the DS vanished). ~0x40 is the
+                     * practical ceiling where the radio still hears the DS AND mostly beats noise --
+                     * the level that reached gamespy. Cap there and RETURN TO BASELINE FAST so a spike
+                     * can never leave us stuck deaf. NWC_R17_CAP overrides. */
+                    int cap = 0x42; { const char *ce=getenv("NWC_R17_CAP"); if (ce&&*ce) cap=(int)strtol(ce,NULL,0); }
+                    int base = 0x38; { const char *be=getenv("NWC_BBP_R17"); if (be&&*be) base=(int)strtol(be,NULL,0); }
+                    int nr = cur_r17;
+                    if (s[3] > 600 && cur_r17 < cap) nr = cur_r17 + 2;         /* noisy -> less sensitive */
+                    else if (s[3] < 400 && cur_r17 > base) nr = cur_r17 - 2;    /* calm -> back to sensitive baseline FAST */
+                    if (nr > cap) nr = cap; if (nr < 0x24) nr = 0x24;
+                    if (nr != cur_r17) { bbp_write(handle, 17, (uint8_t)nr); cur_r17 = nr;
+                        printf("[cca-tune] CCA=%u -> BBP R17=0x%02x (cap 0x%02x)\n", s[3], cur_r17, cap); }
+                }
             }
         }
+        CHK("stacsr");
 #ifndef NWC_BACKEND_KMDF
         if (g_rx_xfers[0]) {
             /* Drive async RX completions (callbacks copy frames into g_rxq). */
             struct timeval tv = { 0, 5000 };   /* 5 ms */
             libusb_handle_events_timeout_completed(g_ctx, &tv, NULL);
-            /* Process everything the callbacks queued. */
-            while (g_rxq_tail != g_rxq_head) {
+            CHK("rxpump");
+            /* Process everything the callbacks queued. Re-pump libusb every few frames so completed
+             * RX URBs get re-armed DURING this (TX-heavy) drain -- otherwise a big DS burst keeps us
+             * here long enough that the dongle's hardware RX FIFO overflows and the MAC wedges
+             * ("goes dark after a successful communication"). Non-blocking (0 timeout). */
+            /* CAP the per-iteration RX processing. Unbounded, a foreign+DS RX burst on busy channel 1
+             * fills g_rxq and draining it ALL in one pass (WEP-decrypt+forward each) stalled the loop
+             * 100ms+ -> beacon starved -> DS dropped mid-green. The 512-entry g_rxq absorbs the burst;
+             * leftover frames drain next iteration, so the beacon still fires on time. NWC_RX_DRAIN. */
+            static int rx_cap = -1;
+            if (rx_cap < 0) { const char *e=getenv("NWC_RX_DRAIN"); rx_cap=(e&&*e)?atoi(e):8; if(rx_cap<2)rx_cap=2; if(rx_cap>256)rx_cap=256; }
+            int drained = 0;
+            int fskip = 0;
+            while (g_rxq_tail != g_rxq_head && drained < rx_cap) {
                 struct rx_frame *f = &g_rxq[g_rxq_tail];
+                /* ACTIVE-CONNECTION RX FILTER (Windows GPCM/crash fix). Once our DS is
+                 * associated and bridging data (g_sta_known), the ONLY frames that
+                 * matter are DATA frames (802.11 type 2) from our DS. Skip everything
+                 * else cheaply BEFORE the expensive log_rx_packet:
+                 *   (a) all MANAGEMENT frames (type 0: auth/assoc/probe). The DS fires
+                 *       spurious re-auth/re-assoc retries (observed auth x30) whose
+                 *       libusbK response TX stalls the drain ~200-800ms EACH -> the
+                 *       server->DS GPCM message (and the DS's uplink ACK) are delayed
+                 *       both ways -> a late login packet is never delivered/ACKed ->
+                 *       61010 / null-deref Data-Abort. The DS is already associated;
+                 *       these retries need no answer. A REAL drop stops data flow ->
+                 *       the 6s bridge-close clears g_sta_known -> mgmt is processed
+                 *       again so genuine reconnect still works.
+                 *   (b) frames from any other transmitter (foreign channel-1 noise).
+                 * Skips don't count against rx_cap, so bursts clear in one cheap pass.
+                 * NWC_RX_ALL disables the filter for A/B. */
+                if (g_sta_known && !env_on("NWC_RX_ALL") && f->len >= 16) {
+                    uint8_t _ftype = (uint8_t)((f->buf[0] >> 2) & 0x3);   /* 0=mgmt 1=ctrl 2=data */
+                    if (_ftype != 2 || memcmp(f->buf + 10, g_sta_mac, 6) != 0) {
+                        g_rxq_tail = (g_rxq_tail + 1) % RXQ_SIZE;
+                        if (++fskip > RXQ_SIZE) break;   /* safety bound */
+                        continue;
+                    }
+                }
+                uint8_t _fty = (f->len>=2) ? (uint8_t)((f->buf[0]>>4)&0xf) : 0xff;
+                unsigned long _ft = GetTickCount();
                 log_rx_packet(handle, f->buf, f->len, mac, ssid, channel, privacy);
+                { unsigned long _fd = GetTickCount()-_ft; if(_fd>150) printf("[stall] rxframe subtype=%u len=%d %lums\n", _fty, f->len, _fd); }
                 g_rxq_tail = (g_rxq_tail + 1) % RXQ_SIZE;
+                if ((++drained & 3) == 0) { struct timeval z = {0,0};
+                    libusb_handle_events_timeout_completed(g_ctx, &z, NULL); }
             }
+            CHK("rxdrain");
             if (g_rx_submit_err != 0) {
                 printf("[rx-async] resubmit error %s; device likely gone\n",
                        libusb_error_name(g_rx_submit_err));
@@ -2761,9 +4124,15 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
         }
 #ifndef _WIN32
         tap_poll_to_ds(handle, mac, ssid, privacy);   /* drain TAP (NAT replies) -> WEP -> TX to DS */
+#else
+        win_poll_wintun(handle, mac, ssid, privacy);  /* drain Wintun (NAT replies) -> WEP -> TX to DS */
+        CHK("wintun");
+        rawret_poll(handle, mac, ssid, privacy);      /* raw-socket return: server replies New-NetNat dropped */
+        wd_drain(handle, mac, ssid, privacy);         /* WinDivert return: gamespy replies -> DS (single-threaded USB TX) */
+        CHK("wddrain");
 #endif
         unsigned long now = GetTickCount();
-        if (!no_sw_beacon && beacon_len && (now - last_beacon) >= 100u) {
+        if (!no_sw_beacon && beacon_len && (now - last_beacon) >= beacon_ms) {
             send_80211_frame(handle, beacon_frame, beacon_len, true, false, "beacon-sw");
             last_beacon = now;
         }
@@ -2772,22 +4141,29 @@ static int ap_loop(libusb_device_handle *handle, uint8_t channel, const char *ss
          *   ->..11 probe-resp (baseline that radiates)   ->..22 full 160B auth-resp
          *   ->..33 short auth-resp (no challenge)         ->..44 raw 160B via probe path */
         static unsigned long last_txtest = 0;
-        if (getenv("NWC_TXTEST") && *getenv("NWC_TXTEST") && (now - last_txtest) >= 2000u) {
+        if (env_on("NWC_TXTEST") && (now - last_txtest) >= 1000u) {
+            /* Radiation self-test (no DS needed): fire a burst of DATA frames to a dummy dest and a
+             * baseline probe-response. Sniff type-2 frames from our BSSID and compare to the counts
+             * printed here to get the data-frame RADIATION RATE (Linux ~91%, Windows was ~40%).
+             * NWC_TXTEST_BURST sets frames/cycle; NWC_TX_GAP_US inserts a spin-gap between them. */
             static const uint8_t d_probe[6] = {0x02,0,0,0,0,0x11};
-            static const uint8_t d_authf[6] = {0x02,0,0,0,0,0x22};
-            static const uint8_t d_auths[6] = {0x02,0,0,0,0,0x33};
-            printf("[txtest] fire: probe(->..11) auth160(->..22) authShort(->..33)\n");
-            send_probe_response(handle, mac, d_probe, ssid, channel, privacy);
-            send_auth_response(handle, mac, d_authf, 1, 2, 0, true);
-            send_auth_response(handle, mac, d_auths, 1, 2, 0, false);
+            static const uint8_t d_data[6]  = {0x02,0,0,0,0,0x44};
+            int burst = 10; const char *be = getenv("NWC_TXTEST_BURST"); if (be&&*be) burst = atoi(be);
+            uint8_t testpay[64]; memset(testpay, 0xA5, sizeof testpay);
+            send_probe_response(handle, mac, d_probe, ssid, channel, privacy);   /* radiating control */
+            for (int k = 0; k < burst; k++)
+                send_eth_to_ds(handle, mac, ssid, privacy, d_data, mac, 0x0800, testpay, sizeof testpay);
+            static int total_test = 0; total_test += burst;
+            printf("[txtest] fired 1 probe + %d DATA frames (data total=%d)\n", burst, total_test);
             last_txtest = now;
         }
-        /* Occasionally re-arm the hardware beacon generator too, harmlessly. */
+        /* Occasionally re-arm the hardware beacon generator too, harmlessly. Note: do NOT read
+         * STA_CSR5 here -- it clears on read and would race the stall detector in the [stacsr]
+         * block, causing false "beacon idle" triggers. */
         if ((now - last_hw_refresh) >= 5000u) {
-            uint16_t sta5 = 0, csr19 = 0;
-            read16(handle, STA_CSR5, &sta5);
+            uint16_t csr19 = 0;
             read16(handle, TXRX_CSR19, &csr19);
-            printf("[tsf] STA_CSR5 beacon-count=%u TXRX_CSR19=0x%04x\n", sta5, csr19);
+            printf("[tsf] TXRX_CSR19=0x%04x\n", csr19);
             if (hw_beacon)
                 hw_load_beacon(handle, mac, ssid, channel, privacy, on, off);
             else
@@ -2865,7 +4241,19 @@ static void dump_all_regs(libusb_device_handle *handle)
 
 int main(int argc, char **argv)
 {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* stdout FULLY BUFFERED (was _IONBF/unbuffered). Unbuffered made every printf an
+     * immediate blocking write() to the redirected log file; log_rx_packet emits a
+     * multi-line per-frame hexdump, so under the connection's frame rate the main loop
+     * drowned in synchronous file-I/O syscalls -- THE 200-800ms per-frame "rxdrain"
+     * stalls that starved the beacon and the server->DS GPCM delivery (ring backed up
+     * to 184 queued), stranding the final login packet -> 61010 / Data-Abort. A 1 MiB
+     * full buffer makes printf a memcpy; the main loop's periodic fflush(stdout) keeps
+     * the log current for diagnostics. NWC_UNBUF restores the old behaviour for A/B. */
+    static char g_outbuf[1 << 20];
+    if (getenv("NWC_UNBUF") && *getenv("NWC_UNBUF"))
+        setvbuf(stdout, NULL, _IONBF, 0);
+    else
+        setvbuf(stdout, g_outbuf, _IOFBF, sizeof g_outbuf);
 
 #ifdef NWC_BACKEND_KMDF
     /*

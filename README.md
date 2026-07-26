@@ -18,6 +18,36 @@ appearing in Wiimmfi's live matchmaking list.
 
 ---
 
+## Quick start — download & run
+
+Prebuilt, ready-to-run builds are published on the [Releases](../../releases) page (one Windows
+build, one Linux build), produced by [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+You need a Ralink **RT2570** dongle (USB `0411:008B` — the original connector hardware) and a DS.
+
+**Windows 10/11**
+1. Download **`nwc-connector.exe`** (a single self-contained executable — the probe engine, Wintun,
+   and libusb are embedded and unpacked on first run).
+2. One time per dongle, bind it to WinUSB/libusbK: run `install-driver.cmd` (from the `.zip`) or
+   [Zadig](https://zadig.akeo.ie/) → select `0411:008B` → install WinUSB.
+3. Run `nwc-connector.exe`. It self-elevates, opens a console with live logging, creates the
+   `NWC-DS` adapter and NAT, and starts the AP. Optional: `nwc-connector.exe --install-autostart`.
+4. On the DS: *Nintendo Wi-Fi Connection Setup → Connect to your Nintendo Wi-Fi USB Connector*.
+
+**Linux**
+1. Download and extract `nwc-connector-linux-x86_64.tar.gz`.
+2. `sudo ./nwc-connector.sh` — installs any missing dependencies, auto-detects the dongle and the
+   internet uplink, brings up the TAP/NAT and a Wiimmfi-redirecting DNS, and starts the probe.
+
+> Both paths get a DS to **Wiimmfi matchmaking**. Linux (kernel NAT) is the reference and the most
+> consistent. The Windows build is a full native port of the same probe engine — it answers DHCP/DNS
+> in-process and NATs the gamespy/matchmaking return traffic through **WinDivert** (userspace),
+> because Windows' built-in NAT silently drops some gamespy replies. Windows is more sensitive to
+> 2.4 GHz congestion and to a VPN capturing the WAN IP, so keep the dongle near the DS, prefer a
+> quiet Wi-Fi channel 1, and split-tunnel any VPN.
+
+---
+
 ## The hardware
 
 The Nintendo Wi-Fi USB Connector is a rebadged Buffalo USB Wi-Fi dongle built on the **Ralink

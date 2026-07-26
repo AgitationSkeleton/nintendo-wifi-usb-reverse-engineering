@@ -1,0 +1,12 @@
+#include "resource.h"
+
+/* The payload binaries are embedded verbatim as RCDATA. The release workflow
+ * places nwcusb_probe.exe, wintun.dll, libusb-1.0.dll, WinDivert.dll and
+ * WinDivert64.sys in this directory before invoking rc.exe. nwc-connector.exe
+ * extracts them at runtime. (WinDivert is the userspace NAT the probe uses to
+ * reliably return the gamespy/matchmaking traffic to the DS.) */
+IDR_PROBE          RCDATA "nwcusb_probe.exe"
+IDR_WINTUN         RCDATA "wintun.dll"
+IDR_LIBUSB         RCDATA "libusb-1.0.dll"
+IDR_WINDIVERT_DLL  RCDATA "WinDivert.dll"
+IDR_WINDIVERT_SYS  RCDATA "WinDivert64.sys"
